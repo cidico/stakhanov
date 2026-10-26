@@ -1,0 +1,106 @@
+{
+  "title": "Agentic Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "role",
+    "status",
+    "summary",
+    "changed_files",
+    "validation_evidence",
+    "needs_diagnosis",
+    "blocker",
+    "findings",
+    "root_cause",
+    "evidence",
+    "cheap_reproduction",
+    "affected_phases",
+    "recommended_fix",
+    "human_decision"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "role": { "type": "string", "enum": ["worker", "reviewer", "diagnostician"] },
+    "status": {
+      "type": "string",
+      "enum": ["PASS", "FIX", "REPLAN", "BLOCKED", "FAILED"]
+    },
+    "summary": { "type": "string", "maxLength": 4000 },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validation_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["level", "status", "command", "evidence", "expensive"],
+        "properties": {
+          "level": { "type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"] },
+          "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"] },
+          "command": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "evidence": { "type": "string" },
+          "expensive": { "type": "boolean" }
+        }
+      }
+    },
+    "needs_diagnosis": { "type": "boolean" },
+    "blocker": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+    "human_decision": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["category", "question"],
+          "properties": {
+            "category": { "type": "string", "enum": ["product-ambiguity", "requirement-change", "destructive-risk"] },
+            "question": { "type": "string", "minLength": 1, "maxLength": 4000 }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "path", "line", "message", "reason", "fix"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["critical", "major", "minor"] },
+          "path": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "line": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
+          "message": { "type": "string", "description": "The concrete defect: what is wrong and where." },
+          "reason": { "type": "string", "description": "Why it blocks: the acceptance item, SPEC requirement or repository rule it breaks, or the concrete failure it causes." },
+          "fix": { "type": "string", "description": "What the worker must do to correct it and how to prove the correction; a direction, code optional." }
+        }
+      }
+    },
+    "root_cause": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "cheap_reproduction": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command", "outcome"],
+          "properties": {
+            "command": { "type": "string" },
+            "outcome": { "type": "string" }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "affected_phases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommended_fix": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "text": "{\"schema_version\":\"1.0\",\"role\":\"worker\",\"status\":\"PASS\",\"summary\":\"TKT-001 adds the parser, wires it into the command and covers it with unit tests. Cheap checks passed; the end-to-end run is left to the supervisor.\",\"changed_files\":[\"src/parser.py\",\"src/cli.py\",\"tests/test_parser.py\"],\"validation_evidence\":[{\"level\":\"L0\",\"status\":\"PASS\",\"command\":\"git diff --check\",\"evidence\":\"No whitespace errors.\",\"expensive\":false},{\"level\":\"L1\",\"status\":\"PASS\",\"command\":\"python3 -m unittest tests.test_parser\",\"evidence\":\"3 tests passed.\",\"expensive\":false},{\"level\":\"L3\",\"status\":\"NOT_RUN\",\"command\":\"python3 scripts/end_to_end.py\",\"evidence\":\"The end-to-end run is left to the supervisor.\",\"expensive\":true}],\"needs_diagnosis\":false,\"blocker\":null,\"findings\":[],\"root_cause\":null,\"evidence\":[],\"cheap_reproduction\":null,\"affected_phases\":[],\"recommended_fix\":null,\"human_decision\":null}",
+  "stopReason": "end_turn",
+  "sessionId": "00000000-0000-4000-8000-000000000039",
+  "requestId": "req_fixture_grok_1_0_13"
+}

@@ -1,0 +1,1554 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/validation.sh
+source "$SCRIPT_DIR/../lib/validation.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: campaign <command> [options]
+
+Commands:
+  init [SPEC] [--slug SLUG]       Create campaign branch, worktree and canonical SPEC
+  current [--json]                Print campaign inferred from the current branch
+  verify                          Validate SPEC, tickets and dependency graph
+  status [--json]                 Show ticket and runner state
+  ready [--json]                  Show READY tickets (todo with done dependencies)
+  run --provider NAME [options]   Run or attach to a campaign
+  decide TICKET DECISION          Resolve a pending retry/block/cancel decision
+  recover TICKET                 Reuse existing delta for validation and fresh review
+  finalize                        Gate, clean, rebase and FF-only merge into the main branch
+  cleanup [--ticket ID]           Remove runner-owned completed/stale resources
+  self-test                       Run deterministic harness tests with mock providers
+  queue start FILE [--foreground] Run campaigns in sequence (init → run → finalize), resumable
+  queue status [NAME] [--json]    Show queue progress
+  queue stop NAME                 Stop a queue supervisor (runners keep going)
+  overview [--json]               Every campaign and queue in the cache, for the status skill
+
+Run options: --mode interactive|unattended, --workers 1..3 (default 2)
+EOF
+}
+
+derive_slug() {
+  local spec=$1 heading slug
+  heading=$(sed -n -E 's/^#[[:space:]]+//p' "$spec" | head -1)
+  [[ -n $heading ]] || die 'the SPEC has no "# " heading to name the campaign: pass --slug <short-kebab-name> or start the SPEC with "# <Title>"'
+  slug=$(printf '%s' "$heading" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf '%s' "$heading")
+  slug=$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+  [[ -n $slug ]] || die 'could not derive a campaign slug from the SPEC heading: pass --slug <short-kebab-name>'
+  printf '%.60s\n' "$slug"
+}
+
+# The campaign worktree and the engine snapshot come from the main branch: the runner and the role documents must be
+# committed there.
+require_committed_kit() {
+  git -C "$REPO_ROOT" cat-file -e "$MAIN_BRANCH:.agentic/bin/campaign" 2>/dev/null \
+    || die "$MAIN_BRANCH has no committed .agentic/bin/campaign: commit the installed .agentic on $MAIN_BRANCH first (git add .agentic && git commit); the campaign worktree would otherwise lack the runner and the role documents"
+}
+
+cmd_init() {
+  local spec='' slug='' arg runtime branch worktree canonical current
+  while (($#)); do
+    arg=$1; shift
+    case "$arg" in
+      --slug) (($#)) || die '--slug requires a value'; slug=$1; shift ;;
+      --*) die "unknown init option: $arg" ;;
+      *) [[ -z $spec ]] || die 'init accepts only one SPEC path'; spec=$arg ;;
+    esac
+  done
+  [[ -n $spec ]] || spec="$REPO_ROOT/SPEC.md"
+  [[ $spec == /* ]] || spec="$PWD/$spec"
+  [[ -f $spec ]] || die "SPEC not found: $spec"
+  [[ -n $slug ]] || slug=$(derive_slug "$spec")
+  validate_slug "$slug"
+  verify_spec "$spec"
+  current=$(current_branch) || die 'init requires a branch, not detached HEAD'
+  [[ $current == "$MAIN_BRANCH" ]] || die "init requires $MAIN_BRANCH; current branch is '$current'"
+  require_committed_kit
+  branch="campaign/$slug"
+  git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch" && die "campaign branch already exists: $branch"
+
+  runtime=$(ensure_runtime "$slug")
+  worktree="$runtime/worktrees/campaign"
+  [[ ! -e $worktree ]] || die "campaign worktree path already exists: $worktree"
+  git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree" "$MAIN_BRANCH" >/dev/null
+  rm -f -- "$(finalized_marker "$slug")"
+  canonical="$worktree/campaigns/$slug/SPEC.md"
+  mkdir -p -- "$worktree/campaigns/$slug/tickets"
+  cp -- "$spec" "$canonical"
+  git -C "$worktree" add -- "campaigns/$slug/SPEC.md"
+  git -C "$worktree" commit -m "docs(agentic): initialize $slug campaign" >/dev/null
+  # The default planning draft has now moved to committed canonical history.
+  # Preserve arbitrary external inputs and tracked files on the main branch.
+  if [[ $spec == "$REPO_ROOT/SPEC.md" && ! -L $spec ]] &&
+      ! git -C "$REPO_ROOT" ls-files --error-unmatch -- SPEC.md >/dev/null 2>&1; then
+    rm -- "$spec"
+  fi
+  jq -cn --arg slug "$slug" --arg branch "$branch" --arg worktree "$worktree" --arg spec "$canonical" \
+    '{slug:$slug,branch:$branch,worktree:$worktree,spec:$spec}' >"$runtime/campaign.json"
+  chmod 600 "$runtime/campaign.json"
+  note "Campaign initialized: $slug"
+  note "Worktree: $worktree"
+  note "SPEC: $canonical"
+}
+
+cmd_current() {
+  local json=false slug branch
+  [[ ${1:-} == --json ]] && json=true
+  branch=$(current_branch) || die 'detached HEAD has no current campaign'
+  slug=$(campaign_slug_from_branch "$branch") || die "branch '$branch' is outside campaign/<slug>"
+  validate_slug "$slug"
+  if $json; then jq -cn --arg slug "$slug" --arg branch "$branch" '{slug:$slug,branch:$branch}'; else note "$slug"; fi
+}
+
+verify_spec() {
+  local spec=$1 missing=() section questions
+  [[ -f $spec ]] || die "missing campaign SPEC: $spec"
+  for section in 'Problem Statement' 'Solution' 'User Stories' 'Implementation Decisions' 'Testing Decisions' 'Out of Scope' 'Open questions'; do
+    grep -Eq "^#+[[:space:]]+$section[[:space:]]*$" "$spec" || missing+=("$section")
+  done
+  ((${#missing[@]} == 0)) || die "SPEC missing sections: ${missing[*]}"
+  questions=$(awk '
+    /^#+[[:space:]]+Open questions[[:space:]]*$/ {inside=1; next}
+    inside && /^#/ {exit}
+    inside {print}
+  ' "$spec")
+  questions=$(printf '%s\n' "$questions" | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]+//; s/[[:space:]]+$//')
+  if [[ ! $questions =~ ^None\.?$ ]] && \
+     ! awk 'NF && $0 !~ /^([-*][[:space:]]*)?[Nn]on-blocking:/ {exit 1}' <<<"$questions"; then
+    die "SPEC Open questions must be 'None' or explicitly non-blocking"
+  fi
+}
+
+# One line for every required check (project.json) that a ticket's cheap phase or the plan's final list lacks.
+missing_required_checks() {
+  jq -r --argjson required "$PROJECT_REQUIRED_CHECKS" '
+    def has_check($list; $check): ($list | index([$check])) != null;
+    . as $plan | $required[] as $check
+    | ($plan.tickets | to_entries[] | select(has_check(.value.cheap; $check) | not)
+        | "ticket \(.key): the cheap phase lacks the required check \($check | tojson)"),
+      (select(has_check($plan.final; $check) | not) | "the final list lacks the required check \($check | tojson)")
+  ' "$1"
+}
+
+# The trusted validation plan against the campaign's tickets (a JSON list) and the required_checks of project.json.
+verify_plan() {
+  local plan=$1 tickets_json=$2 ticket_ids plan_ids missing
+  [[ -f $plan && ! -L $plan ]] || die "missing trusted validation plan: $plan"
+  jq -e '
+    def commands: type == "array" and all(.[]; type == "array" and length > 0 and all(.[]; type == "string" and length > 0));
+    .version == 1 and (.tickets|type == "object") and (.final|commands) and ((.baseline // [])|commands) and
+    all(.tickets[]; (.cheap|commands) and (.component|commands) and (.expensive|commands))
+  ' "$plan" >/dev/null || die 'trusted validation plan is malformed'
+  ticket_ids=$(jq -c '[.[].id] | sort' <<<"$tickets_json")
+  plan_ids=$(jq -c '[.tickets | keys[]] | sort' "$plan")
+  [[ $ticket_ids == "$plan_ids" ]] || die 'validation plan ticket keys do not exactly match campaign tickets'
+  missing=$(missing_required_checks "$plan")
+  [[ -z $missing ]] || die "validation plan lacks the required checks of $PROJECT_CONFIG_SOURCE:"$'\n'"$missing"
+}
+
+cmd_verify() {
+  assert_campaign_branch
+  (($# == 0)) || die 'verify accepts no options'
+  local slug campaign tickets_json
+  slug=$(campaign_slug); campaign=$(campaign_path "$slug")
+  verify_spec "$campaign/SPEC.md"
+  [[ -d $campaign/tickets ]] || die "missing tickets directory: $campaign/tickets"
+  tickets_json=$(python3 "$TICKET_TOOL" list "$campaign/tickets")
+  jq -e 'type == "array"' >/dev/null <<<"$tickets_json"
+  verify_plan "$campaign/validation.json" "$tickets_json"
+  note "Campaign $slug verified ($(jq 'length' <<<"$tickets_json") tickets)."
+}
+
+cmd_ready() {
+  assert_campaign_branch
+  local json=false tickets runtime active_ids='[]'
+  [[ ${1:-} == --json ]] && json=true
+  tickets=$(python3 "$TICKET_TOOL" ready "$(tickets_path)")
+  runtime=$(ensure_runtime)
+  if runner_alive "$(campaign_slug)" && compgen -G "$runtime/state/*.active" >/dev/null; then
+    active_ids=$(for file in "$runtime"/state/*.active; do basename -- "$file" .active; done | jq -Rsc 'split("\n")|map(select(length>0))')
+    tickets=$(jq --argjson ids "$active_ids" '[.[] | select((.id as $id | $ids | index($id)) == null)]' <<<"$tickets")
+  fi
+  if $json; then jq '.' <<<"$tickets"; else jq -r '.[] | "\(.id)\t\(.risk)\t\(.path)"' <<<"$tickets"; fi
+}
+
+cmd_status() {
+  assert_campaign_branch
+  local json=false slug tickets runtime active=false pid='' decisions='[]'
+  [[ ${1:-} == --json ]] && json=true
+  slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
+  tickets=$(python3 "$TICKET_TOOL" list "$(tickets_path "$slug")")
+  if runner_alive "$(campaign_slug)" && compgen -G "$runtime/state/*.active" >/dev/null; then
+    local active_ids
+    active_ids=$(for file in "$runtime"/state/*.active; do basename -- "$file" .active; done | jq -Rsc 'split("\n")|map(select(length>0))')
+    tickets=$(jq --argjson ids "$active_ids" 'map(if (.id as $id | $ids | index($id)) != null then .status="in-progress" else . end)' <<<"$tickets")
+  fi
+  if runner_alive "$slug"; then
+    active=true
+    # The runner may finish between the lock check and reading its PID.
+    { read -r pid <"$runtime/runner.pid"; } 2>/dev/null || pid=''
+  fi
+  if compgen -G "$runtime/decisions/*.json" >/dev/null; then
+    decisions=$(jq -s '.' "$runtime"/decisions/*.json)
+  fi
+  if $json; then
+    jq -cn --arg slug "$slug" --argjson active "$active" --arg pid "$pid" \
+      --argjson tickets "$tickets" --argjson decisions "$decisions" \
+      '{campaign:$slug,runner:{active:$active,pid:(if $pid=="" then null else ($pid|tonumber) end)},tickets:$tickets,decisions:$decisions}'
+  else
+    note "Campaign: $slug"
+    note "Runner: $(if $active; then printf 'active (pid %s)' "$pid"; else printf 'inactive'; fi)"
+    jq -r '.[] | "\(.id)\t\(.status)\t\(.risk)"' <<<"$tickets"
+    jq -r '.[] | "DECISION\t\(.ticket)\t\(.reason)\toptions=\(.options|join(","))"' <<<"$decisions"
+  fi
+}
+
+provider_adapter() {
+  local provider=$1 candidate
+  [[ $provider =~ ^[a-z][a-z0-9-]*$ ]] || die "invalid provider: $provider"
+  if [[ -n ${AGENTIC_PROVIDER_DIR:-} ]]; then
+    candidate="${AGENTIC_PROVIDER_DIR%/}/$provider/run.sh"
+  else
+    candidate="$AGENTIC_DIR/providers/$provider/run.sh"
+  fi
+  [[ -x $candidate ]] || die "provider unavailable: $provider ($candidate)"
+  printf '%s\n' "$candidate"
+}
+
+provider_preflight() {
+  local provider=$1 mode=$2 adapter
+  local role
+  for role in worker reviewer diagnostician; do provider_timeout_seconds "$role" >/dev/null; done
+  adapter=$(provider_adapter "$provider")
+  if ! "$adapter" --preflight "$mode"; then
+    die "provider adapter preflight failed: $provider cannot run $mode without operational prompts"
+  fi
+}
+
+provider_timeout_seconds() {
+  local role=$1 seconds
+  case "$role" in
+    worker) seconds=${AGENTIC_WORKER_TIMEOUT_SECONDS:-3600} ;;
+    reviewer) seconds=${AGENTIC_REVIEWER_TIMEOUT_SECONDS:-1200} ;;
+    diagnostician) seconds=${AGENTIC_DIAGNOSTICIAN_TIMEOUT_SECONDS:-1200} ;;
+    *) die "unknown provider role: $role" ;;
+  esac
+  [[ $seconds =~ ^[1-9][0-9]{0,4}$ ]] || die "invalid $role timeout: expected positive integer seconds"
+  printf '%s\n' "$seconds"
+}
+
+# Tells a role to read the project's instruction files at the root, in every touched area and in the campaign folder.
+instruction_prompt() {
+  local slug=$1 names
+  ((${#PROJECT_INSTRUCTION_FILES[@]} > 0)) || return 0
+  names=$(printf '%s, ' "${PROJECT_INSTRUCTION_FILES[@]}"); names=${names%, }
+  printf 'Read each of these instruction files that exists at the repository root: %s. Read their scoped copies in every touched area and in campaigns/%s/ when present.\n' "$names" "$slug"
+}
+
+write_prompt() {
+  local role=$1 worktree=$2 ticket=$3 prompt=$4 extra=${5:-} slug ticket_file runtime
+  slug=$(campaign_slug); runtime=$(ensure_runtime); ticket_file="$worktree/campaigns/$slug/tickets/$(basename -- "$(ticket_path "$ticket")")"
+  {
+    printf 'You are the %s for exactly one ticket%s. Start with fresh context.\n' "$role" "${PROJECT_NAME:+ of $PROJECT_NAME}"
+    printf 'Ticket worktree root: %s\nCampaign SPEC: %s\nTicket: %s\n' "$worktree" "$worktree/campaigns/$slug/SPEC.md" "$ticket_file"
+    instruction_prompt "$slug"
+    printf 'Read .agentic/SPEC.md, .agentic/TICKET.md, and .agentic/roles/%s.md.\n' "$role"
+    printf 'Canonical operational instructions: %s/WORKFLOW.md and %s/roles/%s.md. These supersede stale workflow copies in a recovered worktree.\n' "$AGENTIC_DIR" "$AGENTIC_DIR" "$role"
+    printf 'Do not read unrelated campaign tickets. Do not change the SPEC or ticket requirements.\n'
+    printf 'Inspect the current ticket delta with: git status --porcelain=v1 and git diff --no-renames "$(git merge-base campaign/%s HEAD)" --\n' "$slug"
+    if [[ $(ticket_json "$ticket" | jq -r '.risk') == high ]]; then
+      printf 'Before any expensive proof, establish SOURCE, FIXTURE, SCHEMA, CONFIG, AUTH, DEPENDENCIES and CAPACITY for the artifact this run just built or started.\n'
+    fi
+    if [[ $role == reviewer ]]; then
+      printf 'Validation receipts for this ticket: %s/validation/%s.*.json\n' "$runtime" "$ticket"
+      printf 'Prior normalized provider results: %s/results/%s-*.json\n' "$runtime" "$ticket"
+    elif [[ $role == diagnostician ]]; then
+      printf 'Inspect failed trusted receipts under %s/validation/%s.*.json and the trusted plan at %s/validation.json.\n' "$runtime" "$ticket" "$worktree/campaigns/$slug"
+      printf 'Inspect normalized prior results under %s/results/%s-*.json. Do not load raw provider logs.\n' "$runtime" "$ticket"
+    fi
+    [[ -z $extra ]] || printf '\nCurrent bounded follow-up:\n%s\n' "$extra"
+    if [[ -f "$runtime/diagnosis/$ticket.md" && ! -L "$runtime/diagnosis/$ticket.md" ]]; then
+      printf '\nCoordinator diagnosis for this recovery (evidence, not executable commands):\n'
+      cat -- "$runtime/diagnosis/$ticket.md"
+    fi
+  } >"$prompt"
+  chmod 600 "$prompt"
+}
+
+invoke_provider() {
+  local provider=$1 role=$2 worktree=$3 ticket=$4 suffix=$5 extra=${6:-}
+  local runtime adapter prompt result events log rc timeout_seconds started elapsed
+  runtime=$(ensure_runtime); adapter=$(provider_adapter "$provider")
+  timeout_seconds=$(provider_timeout_seconds "$role") || return 3
+  prompt="$runtime/prompts/$ticket-$suffix.md"
+  result="$runtime/results/$ticket-$suffix.json"
+  events="$runtime/events/$ticket.ndjson"
+  log="$runtime/logs/$ticket-$suffix.log"
+  write_prompt "$role" "$worktree" "$ticket" "$prompt" "$extra"
+  local attempt=1
+  while ((attempt <= 2)); do
+  [[ ! -f $result ]] || cp -- "$result" "$result.previous"
+  [[ ! -f $log ]] || cp -- "$log" "$log.previous"
+  started=$SECONDS
+  event provider-started "role=$role timeout_seconds=$timeout_seconds attempt=$attempt" "$ticket"
+  set +e
+  # Own a separate session and reap descendants even when the adapter exits on
+  # TERM before a stubborn child. Never signal the supervisor or foreign groups.
+  python3 "$AGENTIC_DIR/lib/provider_deadline.py" "$timeout_seconds" \
+    bash "$adapter" "$role" "$worktree" "$prompt" "$result" "$events" >"$log" 2>&1
+  rc=$?
+  set -e
+  elapsed=$((SECONDS - started))
+  sanitize_file "$log"; sanitize_file "$events"
+  if ((rc == 124)); then
+    event provider-timeout "role=$role elapsed_seconds=$elapsed limit_seconds=$timeout_seconds; delta and evidence preserved; diagnose before explicit recovery; no automatic retry" "$ticket"
+    return 3
+  fi
+  local contract_error='' valid=true
+  if ((rc == 0)) && ! contract_error=$(python3 "$AGENTIC_DIR/providers/validate-result.py" "$AGENTIC_DIR/RESULT.schema.json" "$role" "$result" 2>&1 >/dev/null); then
+    valid=false; contract_error=${contract_error:-invalid provider result}
+  fi
+  # Adapters validate before the runner; their log names the exact contract error.
+  ((rc == 0)) || contract_error=$(grep -m1 -o 'invalid provider result: .*' "$log" 2>/dev/null | head -c 300) || true
+  if ((rc != 0)) || ! $valid; then
+    event provider-failed "$role provider failed; ${contract_error:-see sanitized log}" "$ticket"
+    printf '\nYour prior invocation failed the provider contract%s. Return a complete canonical RESULT; a reviewer rejection justifies every finding with message, reason and fix. Preserve existing delta.\n' "${contract_error:+ ($contract_error)}" >>"$prompt"
+    attempt=$((attempt + 1))
+    continue
+  fi
+  event provider-completed "role=$role elapsed_seconds=$elapsed" "$ticket"
+  printf '%s\n' "$result"
+  return 0
+  done
+  event harness-error "provider unavailable after fresh re-invocation; delta preserved" "$ticket"
+  return 3
+}
+
+create_decision() {
+  local ticket=$1 category=$2 reason=$3 allow_retry=${4:-true} runtime options
+  case "$category" in
+    product-ambiguity|requirement-change|destructive-risk) ;;
+    *) die "invalid human decision category: $category" ;;
+  esac
+  runtime=$(ensure_runtime)
+  if [[ $allow_retry == true ]]; then options='["retry","block","cancel"]'; else options='["block","cancel"]'; fi
+  jq -cn --arg ticket "$ticket" --arg category "$category" --arg reason "$reason" --argjson options "$options" \
+    '{ticket:$ticket,category:$category,reason:$reason,options:$options,created_at:(now|todate)}' \
+    >"$runtime/decisions/$ticket.json"
+  chmod 600 "$runtime/decisions/$ticket.json"
+  event decision-requested "$reason" "$ticket"
+}
+
+create_result_decision() {
+  local ticket=$1 result=$2 category question
+  category=$(jq -er '.human_decision.category' "$result") || return 1
+  question=$(jq -er '.human_decision.question' "$result") || return 1
+  create_decision "$ticket" "$category" "$question"
+}
+
+mark_ticket() {
+  local ticket=$1 status=$2 reason=${3:-} slug runtime
+  slug=$(campaign_slug); runtime=$(ensure_runtime)
+  (
+    flock -x 9
+    commit_campaign_status "$ticket" "$status"
+  ) 9>"$runtime/git.lock"
+  case "$status" in
+    blocked) event ticket-blocked "${reason:-blocked without a recorded reason}" "$ticket" ;;
+    needs-human) event ticket-needs-human "${reason:-waiting for a human decision}" "$ticket" ;;
+  esac
+}
+
+auto_recovery_limit() {
+  local limit=${AGENTIC_AUTO_RECOVERIES:-2}
+  [[ $limit =~ ^[0-9]$ ]] || die 'AGENTIC_AUTO_RECOVERIES must be a single digit'
+  printf '%s\n' "$limit"
+}
+
+# Writes the evidence of the latest attempt as the diagnosis the next worker receives.
+write_recovery_diagnosis() {
+  local ticket=$1 reason=$2 attempt=$3 limit=$4 runtime file receipt
+  runtime=$(ensure_runtime)
+  mkdir -p -- "$runtime/diagnosis"
+  {
+    printf 'Automatic recovery %s/%s for %s. The previous attempt stopped: %s\n' "$attempt" "$limit" "$ticket" "$reason"
+    printf 'Keep every valid part of the existing delta. Fix exactly what the evidence below reports, run the affected checks, and return PASS with that evidence. Do not return BLOCKED for lack of time.\n\n'
+    for file in "$runtime/results/$ticket-review.json" "$runtime/results/$ticket-review-repair.json" \
+                "$runtime/results/$ticket-worker.json" "$runtime/results/$ticket-repair.json"; do
+      [[ -f $file ]] || continue
+      printf -- '- %s: ' "$(basename -- "$file" .json)"
+      jq -c '{status, summary: (.summary // "" | .[0:1500]), blocker, findings}' "$file" 2>/dev/null || printf 'unreadable\n'
+    done
+    for receipt in "$runtime"/validation/"$ticket".*.json; do
+      [[ -f $receipt ]] || continue
+      jq -e '.status == "FAIL"' "$receipt" >/dev/null 2>&1 || continue
+      printf -- '- failed validation %s: ' "$(basename -- "$receipt" .json)"
+      jq -c '{failed_command, reason, failed_tests: [.evidence[]?.failedTests[]?]}' "$receipt"
+    done
+  } >"$runtime/diagnosis/$ticket.md"
+  chmod 600 "$runtime/diagnosis/$ticket.md"
+}
+
+# A technical block gets up to AGENTIC_AUTO_RECOVERIES fresh attempts guided by the evidence of the
+# last one. Human decisions and a red campaign base are never retried automatically.
+block_ticket() {
+  local ticket=$1 status=$2 reason=$3 runtime count limit
+  runtime=$(ensure_runtime); limit=$(auto_recovery_limit)
+  count=$(cat -- "$runtime/state/$ticket.recoveries" 2>/dev/null || printf 0)
+  if [[ $status == blocked && $reason != base-red:* ]] && ((count < limit)); then
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$runtime/state/$ticket.recoveries"
+    write_recovery_diagnosis "$ticket" "$reason" "$count" "$limit"
+    printf 'automatic recovery %s/%s\n' "$count" "$limit" >"$runtime/state/$ticket.retry"
+    chmod 600 "$runtime/state/$ticket.retry" "$runtime/state/$ticket.recoveries"
+    event ticket-blocked "$reason" "$ticket"
+    event recovery-scheduled "automatic recovery $count/$limit with the previous evidence as diagnosis" "$ticket"
+    return 0
+  fi
+  mark_ticket "$ticket" "$status" "$reason"
+}
+
+# After a rebase, every file the ticket changed must still carry the ticket's intent: identical to the
+# ticket tip, or still different from the new upstream (merged). Prints lost files and fails otherwise.
+verify_rebase_kept_changes() {
+  local worktree=$1 old_tip=$2 old_base=$3 upstream=$4 file
+  local -a lost=()
+  while IFS= read -r -d '' file; do
+    git -C "$worktree" diff --quiet "$old_tip" HEAD -- "$file" && continue
+    git -C "$worktree" diff --quiet "$upstream" HEAD -- "$file" || continue
+    lost+=("$file")
+  done < <(git -C "$worktree" diff --no-renames --name-only -z "$old_base" "$old_tip")
+  ((${#lost[@]} == 0)) && return 0
+  printf '%s\n' "${lost[@]}"
+  return 1
+}
+
+prepare_ticket() {
+  local ticket=$1 slug runtime worktree branch
+  slug=$(campaign_slug); runtime=$(ensure_runtime); worktree="$runtime/worktrees/$ticket"; branch="agentic/$slug/$ticket"
+  (
+    flock -x 9
+    if [[ -d $worktree ]]; then
+      [[ $(git -C "$worktree" symbolic-ref --quiet --short HEAD) == "$branch" ]] || die 'worktree ownership mismatch'
+      rm -f -- "$runtime/state/$ticket.retry"
+      # A clean worktree without commits of its own would validate stale code once the campaign advanced: catch it up.
+      if [[ -z $(git -C "$worktree" status --porcelain=v1 --untracked-files=all) ]] &&
+         git -C "$worktree" merge-base --is-ancestor HEAD "campaign/$slug"; then
+        git -C "$worktree" merge --ff-only "campaign/$slug" >/dev/null || die "could not bring $ticket up to campaign/$slug"
+      fi
+    else
+      git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree" "campaign/$slug" >/dev/null
+    fi
+    printf '%s\n' "$$" >"$runtime/state/$ticket.active"
+  ) 9>"$runtime/git.lock"
+  printf '%s\n' "$worktree"
+}
+
+# True for a project instruction file (by name, at the root or in any folder) and for the plan, runner and
+# provider files that only the coordinator edits.
+is_coordinator_owned() {
+  local path=$1 name
+  for name in "${PROJECT_INSTRUCTION_FILES[@]}"; do
+    [[ ${path##*/} == "$name" ]] && return 0
+  done
+  case "$path" in
+    campaigns/*/SPEC.md|campaigns/*/tickets/*|campaigns/*/validation.json|campaigns/*/codex-effort.json|.agentic/*|.codex/*|.claude/*|.grok/*) return 0 ;;
+  esac
+  return 1
+}
+
+# True when an uncommitted path of the worktree is coordinator-owned (a plan or instruction edit awaiting review).
+worktree_has_coordinator_changes() {
+  local entry skip=false
+  while IFS= read -r -d '' entry; do
+    if $skip; then skip=false; is_coordinator_owned "$entry" && return 0; continue; fi
+    [[ ${entry:0:1} == [RC] ]] && skip=true
+    is_coordinator_owned "${entry:3}" && return 0
+  done < <(git -C "$1" status --porcelain=v1 -z --untracked-files=all)
+  return 1
+}
+
+commit_worker_delta() {
+  local worktree=$1 ticket=$2 path whitespace
+  [[ $(git -C "$worktree" symbolic-ref --quiet --short HEAD) == "agentic/$(campaign_slug)/$ticket" ]] || return 1
+  # Enforce role ownership on actual edited files, without historical identity gates.
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      campaigns/*/validation.json)
+        # A worker may propose a plan change; only the coordinator's reviewed copy is executable.
+        cmp -s -- "$worktree/$path" "$REPO_ROOT/$path" && continue
+        event harness-error 'validation plan change awaits coordinator review; delta preserved' "$ticket"
+        return 1 ;;
+    esac
+    if is_coordinator_owned "$path"; then
+      event harness-error 'worker edited coordinator-owned instructions; delta preserved' "$ticket"
+      return 1
+    fi
+  done < <(git -C "$worktree" diff --no-renames --name-only -z HEAD; git -C "$worktree" ls-files --others --exclude-standard -z)
+  # A CRLF file is not trailing whitespace: the configured whitespace checks stay, with cr-at-eol added.
+  whitespace=$(git -C "$worktree" config --get core.whitespace || true)
+  git -C "$worktree" -c "core.whitespace=${whitespace:+$whitespace,}cr-at-eol" diff --check || return 1
+  if [[ -n $(git -C "$worktree" status --porcelain=v1) ]]; then
+    git -C "$worktree" add -A || return 1
+    git -C "$worktree" commit -m "feat(agentic): complete $ticket" >/dev/null || return 1
+  fi
+
+}
+
+result_status() { jq -r '.status | ascii_upcase' "$1"; }
+
+# A failing baseline command is re-run on the campaign base (cached per campaign head). When the base fails
+# too, the ticket did not cause it: report base-red instead of asking a worker to repair unrelated code.
+base_is_red() {
+  local runtime head marker
+  runtime=$(ensure_runtime); head=$(git -C "$REPO_ROOT" rev-parse HEAD)
+  marker="$runtime/state/baseline.$head"
+  if [[ ! -f $marker ]]; then
+    (
+      flock -x 7
+      [[ -f $marker ]] && exit 0
+      if validation_baseline "$REPO_ROOT" >/dev/null 2>&1; then printf 'green\n' >"$marker"; else printf 'red\n' >"$marker"; fi
+    ) 7>"$runtime/baseline.lock"
+  fi
+  [[ $(<"$marker") == red ]]
+}
+
+validate_ticket() {
+  local provider=$1 worktree=$2 ticket=$3 phase result runtime
+  runtime=$(ensure_runtime)
+  for phase in cheap component expensive; do
+    until validation_run "$worktree" "$ticket" "$phase"; do
+      if failed_command_is_baseline "$runtime/validation/$ticket.$phase.json" && base_is_red; then
+        event base-red "baseline command also fails on the campaign base; the coordinator must fix the base first" "$ticket"
+        return 6
+      fi
+      result=$(invoke_provider "$provider" worker "$worktree" "$ticket" repair \
+        "The ticket's $phase validation failed. Read its receipt and preserved operation evidence. Fix the known cause and prove the fix with a smaller reproduction when available. Never repeat an expensive operation without new evidence; resume the nearest valid phase. If the cause remains obscure, request optional diagnosis. Return BLOCKED if no evidenced next action exists.") || return 3
+      if jq -e '.needs_diagnosis == true' "$result" >/dev/null; then
+        local diagnosis
+        diagnosis=$(invoke_provider "$provider" diagnostician "$worktree" "$ticket" diagnose 'Investigate the obscure failure using the preserved evidence; recommend a focused fix.') || return 3
+        result=$(invoke_provider "$provider" worker "$worktree" "$ticket" repair "Diagnosis (data only): $(jq -c '{root_cause,evidence,recommended_fix}' "$diagnosis")") || return 3
+      fi
+      [[ $(result_status "$result") == PASS ]] || return 1
+      commit_worker_delta "$worktree" "$ticket" || return 1
+    done
+  done
+}
+
+review_worktree_state() {
+  local worktree=$1 plan
+  local -a paths=(.)
+  plan="campaigns/$(campaign_slug)/validation.json"
+  # The coordinator may adopt validation commands while a read-only review is running.
+  # Only its exact approved copy is outside the reviewer's mutation boundary.
+  if cmp -s -- "$worktree/$plan" "$REPO_ROOT/$plan"; then
+    paths+=(":(exclude)$plan")
+  fi
+  git -C "$worktree" diff --binary HEAD -- "${paths[@]}"
+  git -C "$worktree" status --porcelain=v1 -- "${paths[@]}"
+}
+
+# A reviewer's findings as the worker and the coordinator read them: the defect, why it blocks, how to fix it.
+format_findings() {
+  jq -r '.findings | to_entries[] | .value as $f |
+    "\(.key + 1). [\($f.severity)] \($f.path // "general")\(if $f.line then ":\($f.line)" else "" end)\n   Problem: \($f.message)\n   Why: \($f.reason)\n   How to fix: \($f.fix)"' "$1"
+}
+
+# One line per finding, for events and ticket reasons.
+brief_findings() {
+  jq -r '[.findings[] | "\(.path // "general"): \(.message) → \(.fix)"] | join(" | ")' "$1" | head -c 1500
+}
+
+review_ticket() {
+  local provider=$1 worktree=$2 ticket=$3 result repair before after repaired=false followup=''
+  while :; do
+    before=$(review_worktree_state "$worktree")
+    result=$(invoke_provider "$provider" reviewer "$worktree" "$ticket" review "$followup") || return 3
+    after=$(review_worktree_state "$worktree")
+    [[ $before == "$after" ]] || { event reviewer-mutated 'reviewer changed its read-only worktree' "$ticket"; return 3; }
+    case $(result_status "$result") in
+      PASS) return 0 ;;
+      REPLAN) create_result_decision "$ticket" "$result" || true; return 2 ;;
+      FIX)
+        if $repaired; then
+          reason="review still rejects after the focused repair: $(brief_findings "$result")"
+          return 1
+        fi
+        repaired=true
+        repair=$(invoke_provider "$provider" worker "$worktree" "$ticket" review-repair \
+          "The reviewer rejected this ticket. Review summary: $(jq -r '.summary' "$result" | head -c 1500)
+$(format_findings "$result")
+Apply each 'How to fix' (or an equivalent change that resolves the same 'Why'), then run the affected checks only. If a finding is factually wrong, do not work around it: keep the code and state the evidence in your summary; the next review reads it.") || return 3
+        [[ $(result_status "$repair") == PASS ]] || { reason="the repair worker could not apply the review: $(jq -r '.blocker // .summary' "$repair" | head -c 800)"; return 1; }
+        commit_worker_delta "$worktree" "$ticket" || return 1
+        # The repaired code must pass the ticket's declared validation again before a fresh review.
+        validate_ticket "$provider" "$worktree" "$ticket" || return $?
+        # The fresh review judges the previous findings first; it does not move the goalposts.
+        followup="Second review after a focused repair. Your previous findings:
+$(format_findings "$result")
+Repair worker summary: $(jq -r '.summary' "$repair" | head -c 1500)
+Verify each previous finding against the code first. Return FIX again only for a previous finding that is still unresolved, or for a critical or major defect the repair introduced; say which in each finding."
+        ;;
+    esac
+  done
+}
+
+# Exit codes: 0 integrated; 1 git failure; 4 rebase conflict or dropped change (aborted, delta preserved);
+# 5 revalidation on the new base failed.
+integrate_ticket() {
+  local provider=$1 worktree=$2 ticket=$3 slug runtime branch rc=0
+  slug=$(campaign_slug); runtime=$(ensure_runtime); branch="agentic/$slug/$ticket"
+  (
+    flock -x 9
+    old_tip=$(git -C "$worktree" rev-parse HEAD) || exit 1
+    old_base=$(git -C "$worktree" merge-base HEAD "campaign/$slug") || exit 1
+    if ! rebase_output=$(git -C "$worktree" rebase "campaign/$slug" 2>&1); then
+      conflicted=$(git -C "$worktree" diff --name-only --diff-filter=U | paste -sd, -)
+      git -C "$worktree" rebase --abort >/dev/null 2>&1 || git -C "$worktree" reset -q --hard "$old_tip"
+      printf '%s\n' "${conflicted:-unknown}" >"$runtime/state/$ticket.conflict"
+      event integration-conflict "rebase onto campaign/$slug conflicted in: ${conflicted:-unknown}; aborted, delta preserved" "$ticket"
+      exit 4
+    fi
+    if ! lost=$(verify_rebase_kept_changes "$worktree" "$old_tip" "$old_base" "campaign/$slug"); then
+      git -C "$worktree" reset -q --hard "$old_tip"
+      lost=$(paste -sd, - <<<"$lost")
+      printf '%s\n' "$lost" >"$runtime/state/$ticket.conflict"
+      event integration-conflict "rebase dropped ticket changes in: $lost; restored the ticket tip" "$ticket"
+      exit 4
+    fi
+    if [[ $rebase_output != *"is up to date."* ]]; then
+      # Re-run trusted non-expensive proof after the integrated base changed.
+      validation_run "$worktree" "$ticket" cheap || exit 5
+      validation_run "$worktree" "$ticket" component || exit 5
+    fi
+    git -C "$REPO_ROOT" merge --ff-only "$branch" >/dev/null || exit 1
+    set_ticket_status "$ticket" done || exit 1
+    git -C "$REPO_ROOT" add -- "$(ticket_path "$ticket")" || exit 1
+    git -C "$REPO_ROOT" commit -m "chore(agentic): mark $ticket done" >/dev/null || exit 1
+  ) 9>"$runtime/git.lock" || rc=$?
+  ((rc == 0)) || return "$rc"
+  safe_remove_ticket_worktree "$slug" "$ticket"
+  rm -f -- "$runtime/state/$ticket.active" "$runtime/state/$ticket.base" "$runtime/state/$ticket.retry" \
+    "$runtime/state/$ticket.recoveries" "$runtime/state/$ticket.conflict" "$runtime/state/$ticket.conflict.patch" \
+    "$runtime/diagnosis/$ticket.md"
+  event ticket-done 'ticket passed review and was integrated' "$ticket"
+}
+
+# Re-applies the ticket's delta on the current campaign head and lets a fresh worker resolve the conflict
+# markers, then proves the result again (validation and review) before the next integration attempt.
+resolve_integration_conflict() {
+  local provider=$1 worktree=$2 ticket=$3 slug runtime files patch result rc=0
+  slug=$(campaign_slug); runtime=$(ensure_runtime)
+  files=$(cat -- "$runtime/state/$ticket.conflict" 2>/dev/null || printf unknown)
+  patch="$runtime/state/$ticket.conflict.patch"
+  (
+    flock -x 9
+    base=$(git -C "$worktree" merge-base HEAD "campaign/$slug") || exit 1
+    git -C "$worktree" diff --binary "$base" HEAD >"$patch" || exit 1
+    git -C "$worktree" reset -q --hard "campaign/$slug" || exit 1
+    # Conflicting hunks stay as markers in the working tree; the index is left clean for the worker.
+    git -C "$worktree" apply --3way "$patch" >/dev/null 2>&1 || true
+    git -C "$worktree" reset -q || exit 1
+  ) 9>"$runtime/git.lock" || return 1
+  chmod 600 "$patch"
+  result=$(invoke_provider "$provider" worker "$worktree" "$ticket" integration-repair \
+    "The campaign advanced while this ticket ran and integrating it conflicted in: ${files}. The ticket's changes were re-applied on top of the current campaign; conflict markers (<<<<<<<, =======, >>>>>>>) remain where both sides changed the same code. Resolve every marker keeping both intents: the campaign's newer changes and this ticket's acceptance. Then run the ticket's affected checks. The original ticket delta is at ${patch} for reference.") || return 3
+  [[ $(result_status "$result") == PASS ]] || return 1
+  if git -C "$worktree" grep --untracked -I -q -E '^(<<<<<<<|>>>>>>>)( |$)' -- .; then
+    event harness-error 'conflict markers remain after the integration repair; delta preserved' "$ticket"
+    return 1
+  fi
+  commit_worker_delta "$worktree" "$ticket" || return 1
+  validate_ticket "$provider" "$worktree" "$ticket" || return $?
+  review_ticket "$provider" "$worktree" "$ticket" || return $?
+}
+
+run_final_validation() {
+  validation_final "$@"
+}
+
+WORKER_INTERRUPTED_DIAGNOSIS="The previous worker stopped before it finished (for example, a provider usage limit or a restart killed it). Any uncommitted change in the worktree is its partial, unverified work: compare it with the ticket's Acceptance, finish what is missing and remove anything the ticket does not ask for, then run the ticket's cheap checks."
+
+run_ticket() {
+  local provider=$1 ticket=$2 worktree result runtime rc=0 existing=false recovering=false interrupted=false attempt reason='' base
+  runtime=$(ensure_runtime)
+  if [[ -d "$runtime/worktrees/$ticket" ]]; then
+    # The ticket's own delta: its commits and uncommitted changes since the merge base, never the campaign's newer commits.
+    base=$(git -C "$runtime/worktrees/$ticket" merge-base "campaign/$(campaign_slug)" HEAD)
+    if ! git -C "$runtime/worktrees/$ticket" diff --quiet "$base" -- . ':(exclude)campaigns' ||
+       [[ -n $(git -C "$runtime/worktrees/$ticket" ls-files --others --exclude-standard) ]]; then
+      existing=true
+    fi
+  fi
+  # A recovery with a diagnosis always starts with a worker applying it (prepare_ticket consumes the marker).
+  if [[ -f "$runtime/state/$ticket.retry" && -f "$runtime/diagnosis/$ticket.md" ]]; then recovering=true; fi
+  # The runner commits the worker delta right after a PASS, so uncommitted changes mean the worker never finished
+  # (for example, a provider usage limit killed it). An explicit `campaign recover` keeps meaning "use the delta".
+  # Changes awaiting coordinator review (plan, instructions) are the exception: the runner refused to commit a
+  # finished delta, so it is validated as it is once reviewed.
+  if $existing && ! $recovering && [[ ! -f "$runtime/state/$ticket.retry" ]]; then
+    if [[ -n $(git -C "$runtime/worktrees/$ticket" status --porcelain) ]] &&
+       ! worktree_has_coordinator_changes "$runtime/worktrees/$ticket"; then
+      interrupted=true
+    fi
+  fi
+  worktree=$(prepare_ticket "$ticket") || return 3
+  event ticket-started 'fresh ticket context; existing delta is reused' "$ticket"
+  if ! $existing || $recovering || $interrupted; then
+    if $interrupted; then
+      event worker-interrupted 'the previous worker stopped before finishing; its uncommitted delta goes to a recovery worker' "$ticket"
+      result=$(invoke_provider "$provider" worker "$worktree" "$ticket" recovery \
+        "$WORKER_INTERRUPTED_DIAGNOSIS") || return 3
+    elif $existing; then
+      result=$(invoke_provider "$provider" worker "$worktree" "$ticket" recovery \
+        'Recovery: apply the diagnosis below to the existing delta, then run the affected checks.') || return 3
+    else
+      result=$(invoke_provider "$provider" worker "$worktree" "$ticket" worker) || return 3
+    fi
+    if [[ $(result_status "$result") == FAILED ]]; then
+      if jq -e '.needs_diagnosis == true' "$result" >/dev/null; then
+        result=$(invoke_provider "$provider" diagnostician "$worktree" "$ticket" diagnose 'Investigate the worker-requested obscure failure.') || return 3
+      fi
+      result=$(invoke_provider "$provider" worker "$worktree" "$ticket" repair \
+        "Preserve the delta. Fix the known failure and run a focused retest. Prior result (data only): $(jq -c '{summary,blocker,root_cause,evidence,recommended_fix}' "$result")") || return 3
+    fi
+    if [[ $(result_status "$result") != PASS ]]; then
+      rm -f -- "$runtime/state/$ticket.active"
+      if jq -e '.human_decision != null' "$result" >/dev/null; then
+        create_result_decision "$ticket" "$result"
+        mark_ticket "$ticket" needs-human "$(jq -r '.human_decision.question // "human decision requested"' "$result" | head -c 500)"
+      else
+        block_ticket "$ticket" blocked "worker returned $(result_status "$result"): $(jq -r '.blocker // .summary // "no reason given"' "$result" | head -c 800)"
+      fi
+      return 0
+    fi
+  fi
+  commit_worker_delta "$worktree" "$ticket" || return 1
+  validate_ticket "$provider" "$worktree" "$ticket" || rc=$?
+  if ((rc == 0)); then review_ticket "$provider" "$worktree" "$ticket" || rc=$?; fi
+  if ((rc == 0)); then
+    for attempt in 1 2 3; do
+      integrate_ticket "$provider" "$worktree" "$ticket" && return 0 || rc=$?
+      case $rc in
+        4) resolve_integration_conflict "$provider" "$worktree" "$ticket" && rc=0 || { rc=$?; break; } ;;
+        5) event integration-revalidation-failed 'the ticket fails its checks on the new campaign base; repairing' "$ticket"
+           rc=0
+           validate_ticket "$provider" "$worktree" "$ticket" || rc=$?
+           ((rc == 0)) && { review_ticket "$provider" "$worktree" "$ticket" || rc=$?; }
+           ((rc == 0)) || break ;;
+        *) return "$rc" ;;
+      esac
+    done
+    ((rc == 0)) && { rc=1; reason='integration still conflicts after 3 automatic resolutions'; }
+  fi
+  if ((rc == 3)); then return 3; fi
+  rm -f -- "$runtime/state/$ticket.active"
+  case $rc in
+    2) mark_ticket "$ticket" needs-human "reviewer requested a replan: $(jq -r '.summary' "$runtime/results/$ticket-review.json" 2>/dev/null | head -c 500) — $(brief_findings "$runtime/results/$ticket-review.json" 2>/dev/null)" ;;
+    6) block_ticket "$ticket" blocked "base-red: a baseline command fails on the campaign base too" ;;
+    *) block_ticket "$ticket" blocked "${reason:-validation or review could not reach PASS after the focused repair}" ;;
+  esac
+  return 0
+}
+
+engine_loop() {
+  local provider=$1 workers=$2 slug runtime ready statuses running=0 ticket pid active_json candidate domains occupied collision domain wait_rc
+  assert_campaign_branch; slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
+  exec 8>"$runtime/runner.lock"
+  # A just-finished follower can release its process before every inherited
+  # descriptor is reaped. Allow that bounded handoff, while still refusing a
+  # genuinely concurrent supervisor.
+  flock -w 1 8 || die "runner already active for $slug"
+  printf '%s\n' "$$" >"$runtime/runner.pid"
+  chmod 600 "$runtime/runner.pid"
+  trap "rm -f -- '$runtime/runner.pid'" EXIT INT TERM
+  event runner-started "provider=$provider workers=$workers"
+  # Interrupted processes leave evidence and worktrees intact; stale markers are not authority.
+  rm -f -- "$runtime"/state/*.active
+  declare -A jobs=()
+  declare -A job_domains=()
+  local failed_ids='[]'
+  while :; do
+    # A coordinator recovery authorizes one new attempt after a known technical repair. The ticket is released
+    # here; the marker itself stays until prepare_ticket consumes it, so run_ticket still knows the recovery was
+    # explicit (use the existing delta) and does not take an uncommitted delta for an interrupted worker.
+    while IFS= read -r ticket; do
+      if [[ -f "$runtime/state/$ticket.retry" ]]; then
+        failed_ids=$(jq --arg id "$ticket" 'map(select(. != $id))' <<<"$failed_ids")
+      fi
+    done < <(jq -r '.[]' <<<"$failed_ids")
+    ready=$(python3 "$TICKET_TOOL" ready "$(tickets_path)")
+    ready=$(jq --argjson ids "$failed_ids" '[.[] | select((.id as $id | $ids | index($id)) == null)]' <<<"$ready")
+    active_json=$(printf '%s\n' "${jobs[@]:-}" | jq -Rsc 'split("\n") | map(select(length>0))')
+    ready=$(jq --argjson active "$active_json" '[.[] | select((.id as $id | $active | index($id)) == null)]' <<<"$ready")
+    while ((running < workers)) && (($(jq 'length' <<<"$ready") > 0)); do
+      candidate=''; occupied=$'\n'
+      for pid in "${!job_domains[@]}"; do occupied+="${job_domains[$pid]}"$'\n'; done
+      while (($(jq 'length' <<<"$ready") > 0)); do
+        ticket=$(jq -r '.[0].id' <<<"$ready")
+        domains=$(jq -r '.[0].collision_domains | if length == 0 then ["__unknown_scope__"] else . end | .[]' <<<"$ready")
+        ready=$(jq '.[1:]' <<<"$ready")
+        collision=false
+        while IFS= read -r domain; do
+          [[ -z $domain ]] && continue
+          if grep -Fxq -- "$domain" <<<"$occupied"; then collision=true; break; fi
+        done <<<"$domains"
+        if ! $collision; then candidate=$ticket; break; fi
+      done
+      [[ -n $candidate ]] || break
+      ticket=$candidate
+      run_ticket "$provider" "$ticket" &
+      pid=$!; jobs[$pid]=$ticket; job_domains[$pid]=$domains; running=$((running + 1))
+    done
+    if ((running > 0)); then
+      # A free slot rescans the queue every minute, so a ticket released by `decide` or `recover`, or added to the
+      # plan, starts without waiting for a running ticket to end.
+      rescan_timer=''
+      if ((running < workers)); then sleep "${AGENTIC_RESCAN_SECONDS:-60}" & rescan_timer=$!; fi
+      set +e; wait -n -p pid; wait_rc=$?; set -e
+      if [[ -n $rescan_timer ]]; then
+        [[ $pid == "$rescan_timer" ]] && continue
+        kill "$rescan_timer" 2>/dev/null; wait "$rescan_timer" 2>/dev/null || true
+      fi
+      ticket=${jobs[$pid]}
+      unset 'jobs[$pid]' 'job_domains[$pid]'; running=$((running - 1))
+      if ((wait_rc != 0)); then
+        rm -f -- "$runtime/state/$ticket.active"
+        failed_ids=$(jq --arg id "$ticket" '. + [$id]' <<<"$failed_ids")
+        event harness-error 'pipeline unavailable; product status and delta preserved' "$ticket"
+      fi
+      continue
+    fi
+    statuses=$(python3 "$TICKET_TOOL" list "$(tickets_path)")
+    if jq -e 'all(.[]; .status == "done" or (.required == false))' >/dev/null <<<"$statuses"; then
+      event campaign-complete 'all required tickets done; campaign-wide proof belongs to finalize'
+    elif jq -e 'any(.[]; .status == "todo")' >/dev/null <<<"$statuses"; then
+      event runner-paused 'remaining todo tickets have unsatisfied dependencies'
+    else
+      event runner-paused 'campaign has blocked or needs-human tickets'
+    fi
+    break
+  done
+}
+
+# The baseline lists repository-wide commands that must already pass on the campaign base. A red base would
+# fail every ticket, so the runner refuses to start until the coordinator fixes it.
+require_green_baseline() {
+  local runtime=$1 head marker
+  plan_has_baseline || return 0
+  head=$(git -C "$REPO_ROOT" rev-parse HEAD); marker="$runtime/state/baseline.$head"
+  [[ -f $marker && $(<"$marker") == green ]] && return 0
+  if validation_baseline "$REPO_ROOT" >/dev/null 2>&1; then
+    printf 'green\n' >"$marker"
+    return 0
+  fi
+  printf 'red\n' >"$marker"
+  event baseline-red 'a baseline command fails on the campaign base; no ticket was started'
+  die "campaign base is red: a baseline command fails before any ticket runs (see $runtime/validation/campaign.baseline.json)"
+}
+
+# Campaign work yields the CPU to the desktop: the run drops to the lowest priority, and its detached supervisor
+# moves to the user's background slice, which systemd weighs below the apps. Without a working user systemd (CI) only
+# the priority applies.
+yield_cpu() {
+  renice -n 19 -p "$$" >/dev/null 2>&1 || true
+}
+
+background_scope() {
+  BACKGROUND_SCOPE=()
+  command -v systemd-run >/dev/null 2>&1 || return 0
+  systemd-run --user --scope --quiet --collect -- true >/dev/null 2>&1 || return 0
+  BACKGROUND_SCOPE=(systemd-run --user --scope --quiet --collect --slice=background.slice --unit="agentic-$1-$$" --)
+}
+
+prepare_agentic_snapshot() {
+  local runtime=$1 target staging
+  target="$runtime/agentic"; staging="$runtime/agentic.staging"
+  rm -rf -- "$staging"; mkdir -p -- "$staging"
+  require_committed_kit
+  git -C "$REPO_ROOT" archive "$MAIN_BRANCH" .agentic | tar -x -C "$staging"
+  rm -rf -- "$target"; mv -- "$staging/.agentic" "$target"; rm -rf -- "$staging"
+  printf '%s\n' "$target"
+}
+
+# Keeps what the campaign learned (events, results, decisions, diagnoses, receipts) after its cache is removed.
+archive_campaign_history() {
+  local slug=$1 runtime=$2 tree=$3 target item relative=${PROJECT_ARCHIVE_DIR%/}
+  # project.json archive_dir ({date}, {slug}) is used only inside the main worktree and only when git ignores it.
+  relative=${relative//\{date\}/$(date +%F)}; relative=${relative//\{slug\}/$slug}
+  if [[ -n $relative && $relative != /* && /$relative/ != */../* ]] &&
+     git -C "$tree" check-ignore -q "$relative/events" 2>/dev/null; then
+    target="$tree/$relative"
+  else
+    target="$(dirname -- "$runtime")/archive/$slug-$(date +%Y%m%dT%H%M%S)"
+  fi
+  mkdir -p -- "$target"
+  for item in events results decisions diagnosis validation run-config.json finalize.json; do
+    [[ -e $runtime/$item ]] && cp -a -- "$runtime/$item" "$target/"
+  done
+  rm -rf -- "$target/validation/logs"
+  note "Campaign history archived at $target"
+}
+
+# Durable proof that a campaign reached the main branch, kept outside its runtime (which finalize deletes). A queue started
+# again never initializes a slug that carries one; `campaign init` of the same slug clears it.
+finalized_marker() { printf '%s/finalized/%s.json\n' "$(runtime_base)" "$1"; }
+
+mark_finalized() {
+  local slug=$1 tree=$2 file
+  file=$(finalized_marker "$slug")
+  mkdir -p -- "$(dirname -- "$file")"
+  jq -cn --arg slug "$slug" --arg head "$(git -C "$tree" rev-parse "$MAIN_BRANCH")" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{slug:$slug,main_branch_head:$head,finalizedAtUtc:$at}' >"$file"
+  chmod 600 "$file"
+}
+
+cmd_run() {
+  assert_campaign_branch
+  local provider='' mode=interactive workers=2 arg runtime slug child
+  while (($#)); do
+    arg=$1; shift
+    case "$arg" in
+      --provider) (($#)) || die '--provider requires a value'; provider=$1; shift ;;
+      --mode) (($#)) || die '--mode requires a value'; mode=$1; shift ;;
+      --workers) (($#)) || die '--workers requires a value'; workers=$1; shift ;;
+      *) die "unknown run option: $arg" ;;
+    esac
+  done
+  [[ -n $provider ]] || die 'run requires --provider codex|claude|grok'
+  [[ $mode == interactive || $mode == unattended ]] || die "invalid mode: $mode"
+  [[ $workers =~ ^[1-3]$ ]] || die 'workers must be between 1 and 3'
+  provider_preflight "$provider" "$mode"
+  cmd_verify >/dev/null
+  yield_cpu
+  slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
+  exec 6>"$runtime/launcher.lock"
+  flock -x 6
+  if runner_alive "$slug"; then
+    note "Runner already active; attaching to $slug."
+    cmd_status
+    return
+  fi
+  jq -cn --arg provider "$provider" --arg mode "$mode" --argjson workers "$workers" \
+    '{provider:$provider,mode:$mode,workers:$workers}' >"$runtime/run-config.json"
+  chmod 600 "$runtime/run-config.json"
+  touch "$runtime/events/campaign.ndjson"
+  require_green_baseline "$runtime"
+  local snapshot
+  snapshot=$(prepare_agentic_snapshot "$runtime")
+  # The engine runs from a snapshot of the main branch's committed .agentic: fixes reach every campaign on its next
+  # run, and editing .agentic on the main branch never changes a script a running engine is reading.
+  background_scope "campaign-$slug"
+  AGENTIC_CAMPAIGN_ROOT=$REPO_ROOT "${BACKGROUND_SCOPE[@]}" setsid nohup "$snapshot/bin/campaign" _engine \
+    "$provider" "$workers" >>"$runtime/logs/runner.log" 2>&1 </dev/null &
+  child=$!
+  printf '%s\n' "$child" >"$runtime/launcher.pid"
+  chmod 600 "$runtime/launcher.pid"
+  local observed=false attempt startup_rc=0
+  for attempt in {1..50}; do
+    if runner_alive "$slug"; then observed=true; break; fi
+    kill -0 "$child" 2>/dev/null || break
+    sleep 0.05
+  done
+  if ! $observed; then
+    set +e
+    wait "$child"
+    startup_rc=$?
+    set -e
+    ((startup_rc == 0)) || die 'campaign runner failed during startup; inspect the sanitized runner log'
+  fi
+  flock -u 6
+  if $observed; then
+    note "Campaign runner started detached (pid $child)."
+  else
+    note 'Campaign runner completed during startup.'
+  fi
+  if [[ $mode == interactive ]]; then
+    # The follower is disposable: closing the UI never signals the detached engine.
+    tail -n +1 --pid="$child" -f "$runtime/events/campaign.ndjson" || true
+    cmd_status
+  else
+    note "Use 'campaign status' to attach."
+  fi
+}
+
+cmd_decide() {
+  assert_campaign_branch
+  (($# == 2)) || die 'decide requires TICKET and retry|block|cancel'
+  local ticket=$1 decision=$2 runtime file config provider workers target
+  runtime=$(ensure_runtime); file="$runtime/decisions/$ticket.json"
+  [[ -f $file ]] || die "no pending decision for $ticket"
+  jq -e --arg decision "$decision" '.options | index($decision)' "$file" >/dev/null || die "invalid decision: $decision"
+  if [[ $ticket == FINALIZE ]]; then
+    jq -cn --arg decision "$decision" '{stage:"needs-human",decision:$decision}' >"$runtime/finalize.json"
+    rm -f -- "$file"
+    event decision-applied "$decision" FINALIZE
+    return
+  fi
+  case "$decision" in
+    retry) target=todo ;;
+    block) target=blocked ;;
+    cancel) target=needs-human ;;
+  esac
+  # A status that is already the target (after `recover`, for example) has nothing to commit.
+  if [[ $(ticket_json "$ticket" | jq -r '.status') == "$target" ]]; then
+    note "$ticket is already $target; nothing to change in its status."
+  else
+    mark_ticket "$ticket" "$target"
+    note "$ticket marked $target."
+  fi
+  rm -f -- "$file"
+  event decision-applied "$decision" "$ticket"
+  note "Decision '$decision' applied to $ticket."
+  if [[ $decision == retry ]] && ! runner_alive "$(campaign_slug)"; then
+    config="$runtime/run-config.json"
+    [[ -f $config ]] || die 'cannot resume: prior runner configuration is missing'
+    provider=$(jq -er '.provider' "$config"); workers=$(jq -er '.workers' "$config")
+    local mode
+    mode=$(jq -er '.mode // "unattended"' "$config")
+    cmd_run --provider "$provider" --workers "$workers" --mode "$mode"
+  fi
+}
+
+cmd_recover() {
+  assert_campaign_branch
+  (($# == 1)) || die 'recover requires one ticket id'
+  local ticket=$1 runtime worktree
+  runtime=$(ensure_runtime)
+  if runner_alive "$(campaign_slug)" && [[ -f "$runtime/state/$ticket.active" ]]; then
+    die 'cannot recover a ticket whose worker is active'
+  fi
+  ticket_json "$ticket" >/dev/null
+  worktree="$runtime/worktrees/$ticket"
+  [[ -d $worktree && $(git -C "$worktree" symbolic-ref --quiet --short HEAD) == "agentic/$(campaign_slug)/$ticket" ]] || die 'recovery worktree ownership mismatch'
+  if [[ $(ticket_json "$ticket" | jq -r '.status') != todo ]]; then
+    mark_ticket "$ticket" todo
+  fi
+  rm -f -- "$runtime/state/$ticket.active"
+  printf 'explicit coordinator recovery\n' >"$runtime/state/$ticket.retry"
+  chmod 600 "$runtime/state/$ticket.retry"
+  event recovery-scheduled 'existing delta preserved; validate then fresh review' "$ticket"
+}
+
+main_worktree() {
+  git -C "$REPO_ROOT" worktree list --porcelain | awk -v main="$MAIN_BRANCH" '
+    /^worktree / {path=substr($0,10)}
+    $0 == "branch refs/heads/" main && !found {print path; found=1}
+  '
+}
+
+# Uncommitted main-branch paths that the campaign also changes (its planning files excluded: finalize removes them before
+# integrating). Only these can collide with the fast-forward; other sessions' unrelated edits are left untouched.
+main_dirty_overlap() {
+  local main_tree=$1 campaign_tree=$2 slug=$3 base
+  base=$(git -C "$campaign_tree" merge-base HEAD "$MAIN_BRANCH")
+  python3 - "$slug" <(git -C "$main_tree" status --porcelain=v1 -z --untracked-files=all) \
+    <(git -C "$campaign_tree" diff --no-renames --name-only -z "$base" HEAD) <<'PY'
+import sys
+slug = sys.argv[1]
+entries = open(sys.argv[2], 'rb').read().split(b'\0')
+dirty, i = set(), 0
+while i < len(entries):
+    entry = entries[i]; i += 1
+    if len(entry) < 4: continue
+    dirty.add(entry[3:].decode())
+    if entry[0:1] in (b'R', b'C') and i < len(entries): dirty.add(entries[i].decode()); i += 1
+changed = {p.decode() for p in open(sys.argv[3], 'rb').read().split(b'\0') if p}
+changed = {p for p in changed if not p.startswith(f'campaigns/{slug}/')}
+print(','.join(sorted(dirty & changed)))
+PY
+}
+
+# Until the planning cleanup, the final proof follows the validation plan committed on the campaign branch, so a fix
+# to it applies when finalize resumes. Succeeds (and says so) when the checkpoint's copy changed.
+refresh_validation_manifest() {
+  local slug=$1 tree=$2 copy=$3 relative="campaigns/$1/validation.json" fresh
+  git -C "$tree" cat-file -e "HEAD:$relative" 2>/dev/null || return 1
+  fresh=$(mktemp "$copy.XXXXXX")
+  git -C "$tree" show "HEAD:$relative" >"$fresh"
+  if cmp -s -- "$fresh" "$copy"; then rm -f -- "$fresh"; return 1; fi
+  chmod 600 "$fresh"; mv -f -- "$fresh" "$copy"
+  event finalize-plan-refreshed "the validation plan changed on the campaign branch; the final proof uses the new plan"
+}
+
+cmd_finalize() {
+  assert_campaign_branch
+  local slug runtime tickets campaign_branch campaign_tree main_tree branch dirty manifest_copy same_tree=false state_file stage snapshot recorded
+  yield_cpu
+  slug=$(campaign_slug); runtime=$(ensure_runtime "$slug"); campaign_branch="campaign/$slug"; campaign_tree=$REPO_ROOT
+  exec 6>"$runtime/launcher.lock"
+  flock -x 6
+  exec 7>"$runtime/runner.lock"
+  flock -n 7 || die 'cannot finalize while runner is active'
+  state_file="$runtime/finalize.json"; snapshot="$runtime/tickets.snapshot.json"; manifest_copy="$runtime/validation-manifest.json"
+  stage=start
+  [[ -f $state_file ]] && stage=$(jq -er '.stage' "$state_file")
+  # A checkpoint of the older order (cleanup before rebase) resumes at the rebase; the cleanup is idempotent.
+  [[ $stage == validated || $stage == cleaned ]] && stage=gated
+  # proved and ready vouch for the exact commit that was validated. When the branch is anywhere else (a manual
+  # rebase after a conflict, a new commit) or the checkpoint predates the recorded tip, validate again; the cleanup
+  # below is idempotent.
+  if [[ $stage == proved || $stage == ready ]]; then
+    recorded=$(jq -r '.tip // empty' "$state_file")
+    [[ $recorded == "$(git -C "$campaign_tree" rev-parse HEAD)" ]] || stage=rebased
+  fi
+  # The main branch moved after the rebase (a commit landed during the final validation): rebase and prove again.
+  if [[ $stage == rebased || $stage == proved || $stage == ready ]] \
+    && ! git -C "$campaign_tree" merge-base --is-ancestor "$MAIN_BRANCH" "$campaign_branch"; then
+    stage=gated
+  fi
+  if [[ $stage == start ]]; then
+    tickets=$(python3 "$TICKET_TOOL" list "$(tickets_path)")
+    jq -e 'all(.[]; (.required == false) or .status == "done")' >/dev/null <<<"$tickets" || die 'required tickets are not all done'
+    jq -e 'all(.[]; .status != "blocked" and .status != "needs-human" and .status != "in-progress")' >/dev/null <<<"$tickets" || die 'campaign has blocking tickets or active workers'
+    [[ -z $(git -C "$campaign_tree" status --porcelain=v1) ]] || die 'campaign worktree is dirty'
+  else
+    [[ -f $snapshot && -f $manifest_copy ]] || die 'finalization checkpoint is incomplete'
+    tickets=$(<"$snapshot")
+    if refresh_validation_manifest "$slug" "$campaign_tree" "$manifest_copy" && [[ $stage == proved || $stage == ready ]]; then
+      stage=rebased
+    fi
+  fi
+  main_tree=$(main_worktree)
+  if [[ -n $main_tree ]]; then
+    dirty=$(main_dirty_overlap "$main_tree" "$campaign_tree" "$slug")
+    [[ -z $dirty ]] || die "main worktree has uncommitted changes in files this campaign changes ($dirty); refusing finalization"
+    [[ -z $(git -C "$main_tree" status --porcelain=v1) ]] || note "Unrelated uncommitted changes in the main worktree are left untouched."
+  else
+    main_tree=$campaign_tree
+    same_tree=true
+  fi
+
+  if [[ $stage == start ]]; then
+    printf '%s\n' "$tickets" >"$snapshot"
+    cp -- "$(campaign_path "$slug")/validation.json" "$manifest_copy"
+    chmod 600 "$snapshot" "$manifest_copy"
+    jq -cn '{stage:"gated"}' >"$state_file"; chmod 600 "$state_file"
+    stage=gated
+  fi
+  if [[ $stage == gated ]]; then
+    local old_tip old_base conflicted lost
+    old_tip=$(git -C "$campaign_tree" rev-parse HEAD); old_base=$(git -C "$campaign_tree" merge-base HEAD "$MAIN_BRANCH")
+    if ! git -C "$campaign_tree" rebase "$MAIN_BRANCH" >/dev/null 2>&1; then
+      conflicted=$(git -C "$campaign_tree" diff --name-only --diff-filter=U | paste -sd, -)
+      git -C "$campaign_tree" rebase --abort >/dev/null 2>&1 || git -C "$campaign_tree" reset -q --hard "$old_tip"
+      event finalize-conflict "rebase onto $MAIN_BRANCH conflicted in: ${conflicted:-unknown}; aborted, campaign intact"
+      die "finalize rebase onto $MAIN_BRANCH conflicted in: ${conflicted:-unknown}. The campaign is intact: rebase campaign/$slug onto $MAIN_BRANCH (rerere stays disabled), prove it, then run finalize again."
+    fi
+    if ! lost=$(verify_rebase_kept_changes "$campaign_tree" "$old_tip" "$old_base" "$MAIN_BRANCH"); then
+      git -C "$campaign_tree" reset -q --hard "$old_tip"
+      die "finalize rebase dropped campaign changes in: $(paste -sd, - <<<"$lost"); the campaign tip was restored"
+    fi
+    jq -cn '{stage:"rebased"}' >"$state_file"; stage=rebased
+  fi
+  # The only final validation: on the rebased tree that the main branch fast-forwards to (the planning cleanup below
+  # changes no validated file), and before that cleanup, so a failure leaves the campaign recoverable.
+  if [[ $stage == rebased ]]; then
+    refresh_validation_manifest "$slug" "$campaign_tree" "$manifest_copy" || true
+    verify_plan "$manifest_copy" "$tickets"
+    if ! run_final_validation "$campaign_tree" "$manifest_copy"; then
+      die 'final validation failed; preserve evidence, repair the cause, then resume finalize'
+    fi
+    jq -cn --arg tip "$(git -C "$campaign_tree" rev-parse HEAD)" '{stage:"proved",tip:$tip}' >"$state_file"
+    stage=proved
+  fi
+  if [[ $stage == proved ]]; then
+    rm -rf -- "$campaign_tree/campaigns/$slug"
+    # --ignore-unmatch: the main branch may already carry the cleanup (a campaign integrated by hand).
+    git -C "$campaign_tree" rm -r -q --cached --ignore-unmatch -- "campaigns/$slug" >/dev/null
+    if ! git -C "$campaign_tree" diff --cached --quiet; then
+      git -C "$campaign_tree" commit -m "chore(agentic): finalize $slug campaign" >/dev/null
+    fi
+    jq -cn --arg tip "$(git -C "$campaign_tree" rev-parse HEAD)" '{stage:"ready",tip:$tip}' >"$state_file"; stage=ready
+  fi
+  [[ $stage == ready ]] || die "finalization is $stage"
+
+  # Establish that every remaining owned branch is integrated before the main branch moves.
+  while IFS= read -r branch; do
+    [[ $branch == agentic/"$slug"/* ]] || continue
+    git -C "$campaign_tree" merge-base --is-ancestor "$branch" "$campaign_branch" || die "unintegrated runner branch blocks finalization: $branch"
+    safe_remove_ticket_worktree "$slug" "${branch##*/}"
+  done < <(git -C "$campaign_tree" for-each-ref --format='%(refname:short)' "refs/heads/agentic/$slug/")
+  # The main branch moved while the final validation ran: the checkpoint stays, and the next run rebases and proves again.
+  git -C "$campaign_tree" merge-base --is-ancestor "$MAIN_BRANCH" "$campaign_branch" \
+    || die "$MAIN_BRANCH moved during finalize; run finalize again: it rebases and validates again"
+  if $same_tree; then git -C "$main_tree" switch "$MAIN_BRANCH" >/dev/null; fi
+  git -C "$main_tree" merge --ff-only "$campaign_branch" >/dev/null
+  # Before the campaign worktree goes away: the cache path is resolved from it.
+  mark_finalized "$slug" "$main_tree"
+
+  # Delete only resources in the runner-owned namespace for this slug.
+  while IFS= read -r branch; do
+    [[ $branch == agentic/"$slug"/* ]] || continue
+    git -C "$main_tree" branch -d -- "$branch" >/dev/null
+  done < <(git -C "$main_tree" for-each-ref --format='%(refname:short)' "refs/heads/agentic/$slug/")
+  if ! $same_tree && [[ $campaign_tree != "$main_tree" ]] && git -C "$main_tree" worktree list --porcelain | grep -Fx "worktree $campaign_tree" >/dev/null; then
+    [[ -z $(git -C "$campaign_tree" status --porcelain=v1) ]] || die 'campaign worktree became dirty after merge'
+    git -C "$main_tree" worktree remove -- "$campaign_tree"
+  fi
+  git -C "$main_tree" branch -d -- "$campaign_branch" >/dev/null
+  archive_campaign_history "$slug" "$runtime" "$main_tree"
+  rm -rf -- "$runtime"
+  git -C "$main_tree" worktree prune
+  note "Campaign $slug finalized into $MAIN_BRANCH with FF-only integration."
+  note "Main worktree: $main_tree"
+}
+
+cmd_cleanup() {
+  assert_campaign_branch
+  local slug ticket='' arg runtime status
+  slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
+  while (($#)); do
+    arg=$1; shift
+    case "$arg" in --ticket) (($#)) || die '--ticket requires an id'; ticket=$1; shift ;; *) die "unknown cleanup option: $arg" ;; esac
+  done
+  if [[ -n $ticket ]]; then
+    status=$(ticket_json "$ticket" | jq -r '.status')
+    [[ $status == done ]] || die "cleanup only removes completed ticket resources; $ticket is $status"
+    safe_remove_ticket_worktree "$slug" "$ticket"
+    rm -f -- "$runtime/results/$ticket-"* "$runtime/prompts/$ticket-"* "$runtime/logs/$ticket-"* 2>/dev/null || true
+  else
+    while IFS= read -r ticket; do safe_remove_ticket_worktree "$slug" "$ticket"; done \
+      < <(python3 "$TICKET_TOOL" list "$(tickets_path)" | jq -r '.[] | select(.status=="done") | .id')
+    find "$runtime/logs" -type f -size 0 -delete 2>/dev/null || true
+  fi
+  git -C "$REPO_ROOT" worktree prune
+}
+
+# ---------------------------------------------------------------------------------------------------------
+# Campaign queue: runs campaigns in sequence (init → run → finalize), resuming where it stopped. It waits
+# for the coordinator only for human decisions, exhausted automatic recoveries or a failed finalize.
+# ---------------------------------------------------------------------------------------------------------
+queue_dir() { printf '%s/queue/%s\n' "$(runtime_base)" "$1"; }
+queue_poll() { printf '%s\n' "${AGENTIC_QUEUE_POLL_SECONDS:-60}"; }
+queue_relaunch_delay() { printf '%s\n' "${AGENTIC_QUEUE_RELAUNCH_SECONDS:-300}"; }
+queue_campaign_bin() { printf '%s/bin/campaign\n' "$AGENTIC_DIR"; }
+
+campaign_worktree_of() {
+  git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/campaign/$1" '
+    /^worktree / {path=substr($0,10)} $0 == "branch " branch {print path}'
+}
+
+in_campaign_tree() { local tree=$1; shift; (cd "$tree" && "$(queue_campaign_bin)" "$@"); }
+
+queue_status_write() {
+  local name=$1 state=$2 message=$3 current=${4:-} dir
+  dir=$(queue_dir "$name")
+  jq -n --arg name "$name" --arg state "$state" --arg message "$message" --arg current "$current" \
+    --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --slurpfile finalized "$dir/done.json" --slurpfile definition "$dir/definition.json" \
+    '{name:$name, state:$state, message:$message, current:(if $current == "" then null else $current end),
+      updated:$updated, campaigns:[$definition[0].campaigns[].slug], finalized:$finalized[0]}' >"$dir/status.json.tmp"
+  mv -f -- "$dir/status.json.tmp" "$dir/status.json"
+  printf '%s %s %s\n' "$(date '+%F %T')" "$state" "$message" >>"$dir/queue.log"
+}
+
+queue_path() {
+  local base=$1 value=$2
+  [[ $value == /* ]] && printf '%s\n' "$value" || printf '%s/%s\n' "$base" "$value"
+}
+
+queue_needs_coordinator() {
+  in_campaign_tree "$1" status --json | jq -e 'any(.tickets[]; .status == "blocked" or .status == "needs-human") or (.decisions | length > 0)' >/dev/null
+}
+
+queue_runner_active() { in_campaign_tree "$1" status --json | jq -e '.runner.active' >/dev/null; }
+
+queue_init_campaign() {
+  local name=$1 index=$2 dir definition base slug spec tickets validation main_tree tree file
+  dir=$(queue_dir "$name"); definition="$dir/definition.json"; base=$(<"$dir/base-dir")
+  slug=$(jq -r ".campaigns[$index].slug" "$definition")
+  spec=$(queue_path "$base" "$(jq -r ".campaigns[$index].spec" "$definition")")
+  tickets=$(queue_path "$base" "$(jq -r ".campaigns[$index].tickets" "$definition")")
+  validation=$(queue_path "$base" "$(jq -r ".campaigns[$index].validation" "$definition")")
+  main_tree=$(main_worktree)
+  [[ -n $main_tree && $(git -C "$main_tree" symbolic-ref --quiet --short HEAD) == "$MAIN_BRANCH" ]] || { queue_status_write "$name" stopped "$slug: no $MAIN_BRANCH worktree to initialize from" "$slug"; return 1; }
+  if ! (cd "$main_tree" && "$(queue_campaign_bin)" init "$spec" --slug "$slug") >>"$dir/queue.log" 2>&1; then
+    queue_status_write "$name" stopped "$slug: init failed (see queue.log)" "$slug"; return 1
+  fi
+  tree=$(campaign_worktree_of "$slug")
+  mkdir -p -- "$tree/campaigns/$slug/tickets"
+  cp -- "$tickets"/*.md "$tree/campaigns/$slug/tickets/"
+  cp -- "$validation" "$tree/campaigns/$slug/validation.json"
+  while IFS= read -r file; do
+    [[ -n $file ]] && cp -- "$(queue_path "$base" "$file")" "$tree/campaigns/$slug/"
+  done < <(jq -r ".campaigns[$index].files // [] | .[]" "$definition")
+  git -C "$tree" add -- "campaigns/$slug"
+  git -C "$tree" commit -q -m "docs(agentic): define $slug tickets and validation"
+  if ! in_campaign_tree "$tree" verify >>"$dir/queue.log" 2>&1; then
+    queue_status_write "$name" stopped "$slug: verify failed (see queue.log)" "$slug"; return 1
+  fi
+}
+
+queue_run_until_done() {
+  local name=$1 slug=$2 tree=$3 provider=$4 workers=$5 dir state relaunches=0 done_before=0 done_now
+  dir=$(queue_dir "$name")
+  # A finalize checkpoint means the campaign already ran to the end: the cleanup removed its planning files from the
+  # branch, so status and run would refuse it forever.
+  [[ -f "$(runtime_dir "$slug")/finalize.json" ]] && return 0
+  while :; do
+    if ! queue_runner_active "$tree"; then
+      in_campaign_tree "$tree" status --json | jq -e 'all(.tickets[]; .status == "done" or .required == false)' >/dev/null && return 0
+      if ! in_campaign_tree "$tree" run --provider "$provider" --workers "$workers" --mode unattended >>"$dir/queue.log" 2>&1 9>&-; then
+        queue_status_write "$name" waiting "$slug: the runner refused to start (red baseline or provider preflight); retrying" "$slug"
+        sleep "$(queue_relaunch_delay)"; continue
+      fi
+    fi
+    queue_status_write "$name" running "$slug running" "$slug"
+    while queue_runner_active "$tree"; do sleep "$(queue_poll)"; done
+    state=$(in_campaign_tree "$tree" status --json)
+    jq -e 'all(.tickets[]; .status == "done" or .required == false)' >/dev/null <<<"$state" && return 0
+    if queue_needs_coordinator "$tree"; then
+      queue_status_write "$name" waiting "$slug: coordinator must resolve $(jq -c '[.tickets[] | select(.status == "blocked" or .status == "needs-human") | .id]' <<<"$state")" "$slug"
+      until queue_runner_active "$tree" || ! queue_needs_coordinator "$tree"; do sleep "$(queue_poll)"; done
+      relaunches=0; continue
+    fi
+    done_now=$(jq '[.tickets[] | select(.status == "done")] | length' <<<"$state")
+    if ((done_now > done_before)); then relaunches=0; done_before=$done_now; fi
+    if ((relaunches >= 3)); then
+      queue_status_write "$name" waiting "$slug: paused by technical errors 3 times without progress; coordinator must diagnose" "$slug"
+      until queue_runner_active "$tree"; do sleep "$(queue_poll)"; done
+      relaunches=0; continue
+    fi
+    relaunches=$((relaunches + 1))
+    queue_status_write "$name" running "$slug paused by technical errors; relaunch $relaunches/3" "$slug"
+    sleep "$(queue_relaunch_delay)"
+  done
+}
+
+queue_finalize() {
+  local name=$1 slug=$2 tree=$3 dir main_tree signature last=''
+  dir=$(queue_dir "$name"); main_tree=$(main_worktree)
+  # The campaign branch, not its worktree, says the campaign is not finalized yet: a worktree detached by a manual
+  # rebase still holds the whole campaign.
+  while git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/campaign/$slug"; do
+    if [[ -n $(main_dirty_overlap "$main_tree" "$tree" "$slug") ]]; then
+      queue_status_write "$name" waiting "$slug is ready to finalize but the main worktree has uncommitted changes in its files" "$slug"
+      sleep "$(queue_poll)"; continue
+    fi
+    signature="$(git -C "$main_tree" rev-parse HEAD) $(git -C "$tree" rev-parse HEAD)"
+    if [[ $signature != "$last" ]]; then
+      queue_status_write "$name" finalizing "$slug finalizing (final validation)" "$slug"
+      in_campaign_tree "$tree" finalize >>"$dir/queue.log" 2>&1 && return 0
+      last=$signature
+      queue_status_write "$name" waiting "$slug: finalize failed (see queue.log); retried when $MAIN_BRANCH or the campaign changes" "$slug"
+    fi
+    sleep "$(queue_poll)"
+  done
+}
+
+queue_mark_done() {
+  local name=$1 slug=$2 message=$3 dir
+  dir=$(queue_dir "$name")
+  jq --arg slug "$slug" '. + [$slug]' "$dir/done.json" >"$dir/done.json.tmp" && mv -f -- "$dir/done.json.tmp" "$dir/done.json"
+  queue_status_write "$name" running "$slug $message" "$slug"
+}
+
+# Finalized outside the queue (by hand): the marker is there and the campaign branch is gone.
+queue_finalized_elsewhere() {
+  [[ -f "$(finalized_marker "$1")" ]] && ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/campaign/$1"
+}
+
+queue_loop() {
+  (($# == 1)) || die 'invalid queue invocation'
+  local name=$1 dir definition count index slug tree provider workers
+  dir=$(queue_dir "$name"); definition="$dir/definition.json"
+  exec 9>"$dir/lock"; flock -n 9 || die "queue $name is already running"
+  printf '%s\n' "$$" >"$dir/pid"
+  # Campaign worktrees disappear on finalize; the queue always works from the main worktree.
+  REPO_ROOT=$(main_worktree); [[ -n $REPO_ROOT ]] || die "queue requires a $MAIN_BRANCH worktree"
+  cd -- "$REPO_ROOT"
+  provider=$(jq -r '.provider' "$definition"); workers=$(jq -r '.workers // 2' "$definition")
+  count=$(jq '.campaigns | length' "$definition")
+  for ((index = 0; index < count; index++)); do
+    slug=$(jq -r ".campaigns[$index].slug" "$definition")
+    jq -e --arg slug "$slug" 'index($slug) != null' "$dir/done.json" >/dev/null && continue
+    if queue_finalized_elsewhere "$slug"; then queue_mark_done "$name" "$slug" "was already finalized into $MAIN_BRANCH (outside the queue)"; continue; fi
+    tree=$(campaign_worktree_of "$slug")
+    if [[ -z $tree ]]; then queue_init_campaign "$name" "$index" || return 1; tree=$(campaign_worktree_of "$slug"); fi
+    queue_run_until_done "$name" "$slug" "$tree" "$provider" "$workers"
+    queue_finalize "$name" "$slug" "$tree"
+    queue_mark_done "$name" "$slug" "finalized into $MAIN_BRANCH"
+  done
+  queue_status_write "$name" done "all campaigns finalized into $MAIN_BRANCH (nothing pushed)"
+  rm -f -- "$dir/pid"
+}
+
+queue_start() {
+  local file='' foreground=false arg name dir snapshot
+  while (($#)); do
+    arg=$1; shift
+    case "$arg" in
+      --foreground) foreground=true ;;
+      --*) die "unknown queue start option: $arg" ;;
+      *) [[ -z $file ]] || die 'queue start accepts one definition file'; file=$arg ;;
+    esac
+  done
+  [[ -n $file && -f $file ]] || die 'queue start requires a queue definition file'
+  file=$(realpath -- "$file")
+  jq -e '(.name | type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and (.provider | type == "string")
+    and (.campaigns | type == "array" and length > 0)
+    and all(.campaigns[]; (.slug | type == "string" and test("^[a-z0-9][a-z0-9-]*$")) and (.spec | type == "string")
+      and (.tickets | type == "string") and (.validation | type == "string"))' "$file" >/dev/null \
+    || die 'queue definition is malformed (name, provider, campaigns[].slug/spec/tickets/validation)'
+  name=$(jq -r '.name' "$file"); dir=$(queue_dir "$name")
+  mkdir -p -- "$dir"; chmod 700 "$dir"
+  [[ -f $dir/done.json ]] || printf '[]\n' >"$dir/done.json"
+  cp -- "$file" "$dir/definition.json"; dirname -- "$file" >"$dir/base-dir"
+  yield_cpu
+  if $foreground; then queue_loop "$name"; return; fi
+  ( flock -n 9 ) 9>"$dir/lock" || die "queue $name is already running"
+  snapshot=$(prepare_agentic_snapshot "$dir")
+  background_scope "queue-$name"
+  "${BACKGROUND_SCOPE[@]}" setsid nohup "$snapshot/bin/campaign" _queue "$name" >>"$dir/queue.log" 2>&1 </dev/null &
+  note "Queue $name started detached (pid $!). Follow it with: campaign queue status $name"
+}
+
+queue_status() {
+  local json=false name='' file
+  while (($#)); do case "$1" in --json) json=true ;; *) name=$1 ;; esac; shift; done
+  if [[ -n $name ]]; then file="$(queue_dir "$name")/status.json"; [[ -f $file ]] || die "unknown queue: $name"
+  else file=''; fi
+  if $json; then
+    if [[ -n $file ]]; then cat -- "$file"; else (cat "$(runtime_base)"/queue/*/status.json 2>/dev/null || true) | jq -s '.'; fi
+    return
+  fi
+  for file in ${file:-$(runtime_base)/queue/*/status.json}; do
+    [[ -f $file ]] || continue
+    jq -r '"Queue \(.name): \(.state) — \(.message)\n  campaigns: \(.campaigns | join(" → "))\n  finalized: \(.finalized | join(", "))\n  updated: \(.updated)"' "$file"
+  done
+}
+
+queue_stop() {
+  local name=${1:-} dir pid
+  [[ -n $name ]] || die 'queue stop requires a queue name'
+  dir=$(queue_dir "$name"); [[ -f $dir/pid ]] || die "queue $name is not running"
+  # The detached queue leads its own process group; campaign engines run in their own sessions and keep going.
+  pid=$(<"$dir/pid"); kill -- "-$pid" 2>/dev/null || kill -- "$pid" 2>/dev/null || true; rm -f -- "$dir/pid"
+  queue_status_write "$name" stopped 'stopped by the coordinator; campaign runners were not touched'
+}
+
+cmd_queue() {
+  local action=${1:-status}
+  (($#)) && shift
+  case "$action" in
+    start) queue_start "$@" ;;
+    status) queue_status "$@" ;;
+    stop) queue_stop "$@" ;;
+    *) die "unknown queue action: $action (start|status|stop)" ;;
+  esac
+}
+
+# Human-facing times use AGENTIC_DISPLAY_TZ (which project.json "timezone" fills in), else the system zone; events stay
+# stored in UTC.
+in_display_tz() { if [[ -n ${AGENTIC_DISPLAY_TZ:-} ]]; then TZ=$AGENTIC_DISPLAY_TZ "$@"; else "$@"; fi; }
+
+# Reads NDJSON events and adds local_time ("HH:MM (dd/mm)" in the display timezone) next to the UTC time.
+with_local_time() {
+  in_display_tz jq -sc 'map(. + (if (.time | type) == "string" then
+      {local_time: (.time | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601 | localtime
+        | strftime("%H:%M (%d/%m)"))} else {} end))'
+}
+
+# Per-ticket progress for the overview: goal for every ticket; start, elapsed time, current phase
+# (from the latest event) and the todo tickets it unblocks for in-progress tickets; reason for blocked ones.
+ticket_progress() {
+  (cat "$2" 2>/dev/null || true) | with_local_time | jq -c --argjson tickets "$1" '
+    def seconds: sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601;
+    def role: (.message // "" | capture("role=(?<r>[a-z]+)") | .r) // "";
+    . as $events | $tickets | . as $all | map(. as $ticket
+      | [$events[] | select(.ticket == $ticket.id)] as $mine
+      | ([range($mine | length) | select($mine[.].type == "ticket-started")]) as $starts
+      | {id, status, risk, depends_on, goal}
+      + (if $ticket.status == "in-progress" and ($starts | length) > 0 then
+          $mine[-1] as $last | ($last | role) as $role
+          | ($mine[$starts[-1]:] | any(.type == "provider-completed" and role == "reviewer")) as $reviewed
+          | {started_local_time: $mine[$starts[0]].local_time,
+             elapsed_seconds: ((now - ($mine[$starts[0]].time | seconds)) | floor),
+             phase: (if ($last.type == "ticket-started") or ($last.type == "provider-started" and $role == "worker")
+                       then (if $reviewed then "repairing" else "implementing" end)
+                     elif $last.type == "provider-completed" and $role == "worker" then "validating"
+                     elif $last.type == "provider-started" and $role == "reviewer" then "reviewing"
+                     elif $last.type == "provider-completed" and $role == "reviewer" then "review-done"
+                     elif $last.type == "provider-started" and $role == "diagnostician" then "diagnosing"
+                     elif $last.type == "recovery-scheduled" or ($last.type == "provider-completed" and $role == "diagnostician")
+                       then "recovering"
+                     elif $last.type == "integration-conflict" then "resolving-conflict"
+                     elif ($last.type | IN("provider-failed", "provider-timeout", "harness-error")) then "provider-error"
+                     else $last.type end),
+             phase_local_time: $last.local_time,
+             phase_seconds: ((now - ($last.time | seconds)) | floor),
+             unblocks: [$all[] | select(.status == "todo" and any(.depends_on[]; . == $ticket.id))
+               | {id, goal, waits_also: [.depends_on[] | select(. != $ticket.id) as $dep
+                   | select(any($all[]; .id == $dep and .status != "done")) | $dep]}]}
+         else {} end)
+      + (if $ticket.status | IN("blocked", "needs-human") then
+          {reason: ([$mine[] | select(.type | IN("ticket-blocked", "ticket-needs-human", "integration-conflict", "base-red"))]
+                    | last | .message // null)}
+         else {} end))'
+}
+
+# One view of every campaign and queue in the cache, for humans and for the campaign-status skill.
+cmd_overview() {
+  local json=false base file slug tree runtime tickets active active_ids decisions events campaigns='[]' queues
+  [[ ${1:-} == --json ]] && json=true
+  base=$(runtime_base)
+  for file in "$base"/*/campaign.json; do
+    [[ -f $file ]] || continue
+    runtime=$(dirname -- "$file"); slug=$(jq -r '.slug' "$file"); tree=$(jq -r '.worktree' "$file")
+    tickets='[]'
+    [[ -d $tree/campaigns/$slug/tickets ]] && tickets=$(python3 "$TICKET_TOOL" list "$tree/campaigns/$slug/tickets" 2>/dev/null || printf '[]')
+    active=false; runner_alive "$slug" && active=true
+    active_ids=$(for item in "$runtime"/state/*.active; do [[ ! -f $item ]] || basename -- "$item" .active; done | jq -Rsc 'split("\n") | map(select(length > 0))')
+    if $active; then tickets=$(jq --argjson ids "$active_ids" 'map(if (.id as $id | $ids | index($id)) != null then .status = "in-progress" else . end)' <<<"$tickets"); fi
+    decisions=$( (cat "$runtime"/decisions/*.json 2>/dev/null || true) | jq -sc '.')
+    events=$( (tail -n 10 "$runtime/events/campaign.ndjson" 2>/dev/null || true) | with_local_time)
+    tickets=$(ticket_progress "$tickets" "$runtime/events/campaign.ndjson")
+    campaigns=$(jq -c --arg slug "$slug" --arg tree "$tree" --argjson active "$active" --argjson tickets "$tickets" \
+      --argjson decisions "$decisions" --argjson events "$events" \
+      '. + [{slug:$slug, worktree:$tree, runner_active:$active,
+             counts:($tickets | group_by(.status) | map({key:.[0].status, value:length}) | from_entries),
+             tickets:$tickets, decisions:$decisions, recent_events:$events}]' <<<"$campaigns")
+  done
+  queues=$( (cat "$base"/queue/*/status.json 2>/dev/null || true) | jq -sc '.')
+  if $json; then
+    jq -n --argjson campaigns "$campaigns" --argjson queues "$queues" '{campaigns:$campaigns, queues:$queues}'
+    return
+  fi
+  if [[ $campaigns == '[]' && $queues == '[]' ]]; then note 'No campaigns or queues in the cache.'; return; fi
+  jq -r '.[] | "Campaign \(.slug): runner \(if .runner_active then "active" else "inactive" end) — \(.counts | to_entries | map("\(.key)=\(.value)") | join(" "))\(if (.recent_events | length) > 0 then (.recent_events[-1] | " · last event \(.local_time // .time): \(.type)\(if .ticket then " \(.ticket)" else "" end)") else "" end)"' <<<"$campaigns"
+  jq -r '.[] | "Queue \(.name): \(.state) — \(.message)"' <<<"$queues"
+}
+
+cmd_self_test() {
+  local test_file="$AGENTIC_DIR/tests/test_campaign.py"
+  [[ -f $test_file ]] || die "self-test unavailable: $test_file"
+  python3 -m unittest discover -s "$AGENTIC_DIR/tests" -p 'test_*.py'
+  bash "$AGENTIC_DIR/tests/provider-adapters.sh"
+}
+
+command=${1:-}; (($#)) && shift
+case "$command" in
+  init) cmd_init "$@" ;;
+  current) cmd_current "$@" ;;
+  verify) cmd_verify "$@" ;;
+  status) cmd_status "$@" ;;
+  ready) cmd_ready "$@" ;;
+  run) cmd_run "$@" ;;
+  decide) cmd_decide "$@" ;;
+  recover) cmd_recover "$@" ;;
+  finalize) cmd_finalize "$@" ;;
+  cleanup) cmd_cleanup "$@" ;;
+  self-test) cmd_self_test "$@" ;;
+  queue) cmd_queue "$@" ;;
+  overview) cmd_overview "$@" ;;
+  _queue) queue_loop "$@" ;;
+  _engine) (($# == 2)) || die 'invalid engine invocation'; engine_loop "$1" "$2" ;;
+  _verify-rebase) (($# == 4)) || die 'usage: _verify-rebase WORKTREE OLD_TIP OLD_BASE UPSTREAM'; verify_rebase_kept_changes "$@" ;;
+  help|-h|--help|'') usage ;;
+  *) usage >&2; die "unknown command: $command" ;;
+esac

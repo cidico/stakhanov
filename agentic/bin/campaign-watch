@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Waits until an unattended campaign needs its coordinator, prints why, and exits 0.
+#
+#   campaign-watch [--slug SLUG] [--until TICKET=STATUS]... [--stall-minutes N] [--max-minutes N]
+#                  [--ignore-required-done]
+#
+# It returns only for: runner stopped, pending decision, blocked ticket, needs-human ticket whose
+# dependencies are done, a provider timeout or harness error after it started, a provider with no event
+# and no CPU use for longer than --stall-minutes (default 45), a --until milestone, or every required
+# ticket done (skip that with --ignore-required-done while an optional ticket still runs; the runner
+# stopping still wakes). Otherwise it returns after --max-minutes (default 115) with a ROUTINE line;
+# just re-arm it. Routine starts, completions and phase changes never wake the coordinator.
+# Without --slug it watches the campaign of the current branch.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+campaign="$root/.agentic/bin/campaign"
+slug='' stall=45 max=115 ignore_done=0
+until=()
+while (($#)); do
+  case $1 in
+    --slug) slug=$2; shift 2 ;;
+    --until) until+=("$2"); shift 2 ;;
+    --stall-minutes) stall=$2; shift 2 ;;
+    --max-minutes) max=$2; shift 2 ;;
+    --ignore-required-done) ignore_done=1; shift ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "campaign-watch: unknown option $1" >&2; exit 64 ;;
+  esac
+done
+[[ -n $slug ]] || slug=$("$campaign" current) || { echo 'campaign-watch: pass --slug outside a campaign branch' >&2; exit 64; }
+
+worktree=$("$campaign" overview --json | python3 -c '
+import json, sys
+for c in json.load(sys.stdin)["campaigns"]:
+    if c["slug"] == sys.argv[1]:
+        print(c["worktree"]); break
+' "$slug")
+[[ -n $worktree && -d $worktree ]] || { echo "campaign-watch: campaign $slug not found" >&2; exit 64; }
+cache=$(dirname -- "$(dirname -- "$worktree")")
+events="$cache/events"
+until_csv=$(IFS=,; echo "${until[*]-}")
+
+# CPU ticks spent by this campaign's provider adapters and everything under them, or nothing when none runs.
+# The event files only change when a role starts or ends, so a worker deep in a long build or test looks
+# silent there while its process tree keeps burning CPU.
+provider_cpu() {
+  python3 - "$cache/agentic/providers/" <<'PY'
+import os, sys
+procs = {}
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        continue
+    procs[pid] = (fields[1], sum(int(x) for x in fields[11:15]), cmdline)
+children = {}
+for pid, (ppid, _, _) in procs.items():
+    children.setdefault(ppid, []).append(pid)
+stack = [pid for pid, (_, _, cmd) in procs.items() if sys.argv[1] in cmd and "/run.sh " in cmd]
+if stack:
+    total, seen = 0, set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += procs[pid][1]
+        stack += children.get(pid, [])
+    print(total)
+PY
+}
+busy_cpu='' busy_at=$(date +%s)
+since=$(date -u +%Y-%m-%dT%H:%M:%S)
+
+# Provider deadlines and harness failures park a ticket without blocking it or stopping the runner; they need the
+# coordinator's diagnosis and explicit recovery, so they wake it too.
+parked_since() {
+  python3 - "$events/campaign.ndjson" "$since" <<'PY'
+import json, sys
+seen = []
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if event.get("time", "")[:19] >= sys.argv[2] and event.get("type") in ("provider-timeout", "harness-error"):
+        seen.append("%s %s" % (event.get("ticket", "?"), event["type"]))
+print("; ".join(dict.fromkeys(seen)))
+PY
+}
+
+for ((minute = 1; minute <= max; minute++)); do
+  sleep 60
+  reasons=$( (cd -- "$worktree" && "$campaign" status --json) | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+status = {t["id"]: t["status"] for t in data["tickets"]}
+required = {t["id"]: t.get("required", True) for t in data["tickets"]}
+depends = {t["id"]: t.get("depends_on") or [] for t in data["tickets"]}
+why = []
+if not data.get("runner", {}).get("active"):
+    why.append("runner stopped")
+if data.get("decisions"):
+    why.append("decision pending")
+why += ["%s blocked" % k for k, v in status.items() if v == "blocked"]
+# A checkpoint planned as needs-human waits for its dependencies before the coordinator can act on it.
+why += ["%s needs-human" % k for k, v in status.items()
+        if v == "needs-human" and all(status.get(d) == "done" for d in depends[k])]
+for item in filter(None, sys.argv[1].split(",")):
+    ticket, _, wanted = item.partition("=")
+    if status.get(ticket) == wanted:
+        why.append("milestone %s" % item)
+if sys.argv[2] == "0" and all(v == "done" for k, v in status.items() if required[k]):
+    why.append("every required ticket done")
+print("; ".join(why))
+' "$until_csv" "$ignore_done") || reasons='status unreadable'
+  parked=$(parked_since)
+  [[ -z $parked ]] || reasons=${reasons:+$reasons; }$parked
+  if [[ -n $reasons ]]; then
+    echo "WAKE [$(date +%H:%M)] $slug: $reasons"
+    exit 0
+  fi
+  newest=$(ls -t -- "$events"/*.ndjson 2>/dev/null | head -n 1 || true)
+  cpu=$(provider_cpu)
+  if [[ -n $newest && -n $cpu ]]; then
+    now=$(date +%s)
+    [[ $cpu == "$busy_cpu" ]] || { busy_cpu=$cpu; busy_at=$now; }
+    last=$(stat -c %Y -- "$newest")
+    (( busy_at > last )) && last=$busy_at
+    idle=$(( now - last ))
+    if (( idle > stall * 60 )); then
+      echo "WAKE [$(date +%H:%M)] $slug: provider silent for $((idle / 60)) min ($(basename -- "$newest"))"
+      exit 0
+    fi
+  fi
+done
+echo "ROUTINE [$(date +%H:%M)] $slug: nothing needed in $max min; re-arm"

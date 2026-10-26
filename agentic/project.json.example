@@ -1,0 +1,9 @@
+{
+  "name": "",
+  "main_branch": "",
+  "instruction_files": ["AGENTS.md", "CLAUDE.md"],
+  "env": {},
+  "required_checks": [],
+  "timezone": "",
+  "archive_dir": ""
+}
