@@ -157,6 +157,12 @@ install -d -- "${shared[@]}"
 chown root:"$EXECUTOR_GROUP" -- "${shared[@]}"
 chmod 2770 -- "${shared[@]}"
 install -d -m 2770 -o "$EXECUTOR_USER" -g "$EXECUTOR_GROUP" -- "$EXECUTOR_STATE_DIR/accounts"
+# The unit locks, writable by the group: the status and admit commands also run as the run user.
+units_dir=$EXECUTOR_STATE_DIR/units
+for ((index = 1; index <= EXECUTOR_UNITS; index++)); do touch -- "$units_dir/u$index"; done
+touch -- "$units_dir/mutex"
+chown root:"$EXECUTOR_GROUP" -- "$units_dir"/u* "$units_dir/mutex"
+chmod 660 -- "$units_dir"/u* "$units_dir/mutex"
 install -d -m 700 -o "$EXECUTOR_USER" -g "$EXECUTOR_GROUP" -- "$EXECUTOR_ACCOUNTS_DIR"
 for account in "${EXECUTOR_ACCOUNT_NAMES[@]}"; do
   install -d -m 700 -o "$EXECUTOR_USER" -g "$EXECUTOR_GROUP" -- "$EXECUTOR_ACCOUNTS_DIR/$account"

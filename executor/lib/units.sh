@@ -64,9 +64,10 @@ executor_units_wait() { # K
 
 # executor_units_free: prints how many units are free now.
 executor_units_free() {
-  local i fd mutex free=0 dir
+  local i fd mutex free=0 dir mask
   dir=$(executor_units_dir)
-  exec {mutex}>>"$dir/mutex" || return 1
+  mask=$(umask); umask 002
+  exec {mutex}>>"$dir/mutex" || { umask "$mask"; return 1; }
   flock "$mutex"
   for ((i = 1; i <= EXECUTOR_UNITS; i++)); do
     exec {fd}>>"$dir/u$i"
@@ -74,5 +75,6 @@ executor_units_free() {
     exec {fd}>&-
   done
   exec {mutex}>&-
+  umask "$mask"
   printf '%s\n' "$free"
 }
