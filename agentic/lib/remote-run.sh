@@ -58,6 +58,9 @@ read -r -a ssh_command <<<"${AGENTIC_SSH:-ssh}"
 ssh_options=(-o BatchMode=yes -o ConnectTimeout=15)
 ssh_line="${AGENTIC_SSH:-ssh} ${ssh_options[*]}"
 
+# The adapter's run gets a connection of its own: when this runner dies, that connection's end is how the executor
+# (its run prefix) can tell, while a shared ControlMaster session would outlive it.
+own_connection=()
 temporary=$(mktemp -d)
 run_pid='' pgid_file=''
 trap 'rm -rf -- "$temporary"' EXIT
@@ -70,7 +73,7 @@ remote_script() {
   local script=$1 line='set --' argument
   shift
   for argument in "$@"; do line+=" $(printf '%q' "$argument")"; done
-  printf '%s\n{\n%s\n}\n' "$line" "$script" | "${ssh_command[@]}" "${ssh_options[@]}" "$destination" bash -s
+  printf '%s\n{\n%s\n}\n' "$line" "$script" | "${ssh_command[@]}" "${ssh_options[@]}" "${own_connection[@]}" "$destination" bash -s
 }
 
 unavailable() {
@@ -255,9 +258,11 @@ environment+=("GIT_CONFIG_KEY_$count=safe.directory" "GIT_CONFIG_VALUE_$count=$w
 
 pgid_file="$base/.agentic/run/$key-$ticket-$$.pgid"
 rc=0
+own_connection=(-o ControlMaster=no -o ControlPath=none)
 remote_script "$RUN" "$pgid_file" "${run_prefix[@]}" env "${environment[@]}" \
   bash "$adapter" "$role" "$worktree" "$prompt" "$result" "$events" &
 run_pid=$!
+own_connection=()
 wait "$run_pid" || rc=$?
 run_pid=''
 if ((rc == 75)); then

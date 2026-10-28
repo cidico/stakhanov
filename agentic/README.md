@@ -197,7 +197,9 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
   the work stays in `<root><worktree>` until the next remote invocation of the ticket replaces it.
 - The host needs `bash`, `git`, `rsync` and `setsid`; the adapter's own commands (`claude`, `jq`, `python3`...)
   must exist where `run` runs it. Each invocation opens about ten ssh connections: an `ssh_config` with
-  `ControlMaster auto` and `ControlPersist` for the host makes them cheap.
+  `ControlMaster auto` and `ControlPersist` for the host makes them cheap. The adapter's run always gets a connection
+  of its own (`ControlMaster=no`): when the runner here dies, that session ends on the executor, and a `run` prefix can
+  watch for it to stop what it started.
 - `AGENTIC_EXECUTORS=local` runs everything here. The mirror and the remote worktrees are never pruned.
 - `campaign-watch` measures the CPU of local processes only: a remote worker that writes no event for longer than
   `--stall-minutes` wakes the coordinator as a silent provider.
