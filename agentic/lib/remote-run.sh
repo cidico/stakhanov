@@ -12,7 +12,8 @@
 # in its own process group; copy the result, the events, the working files and the sync_paths back. --env names a variable forwarded to the adapter besides
 # every AGENTIC_* one.
 #
-# Exit status: 75 when the executor is unavailable before the adapter started (nothing local changed); otherwise the
+# Exit status: 75 when the executor is unavailable before the adapter started (unreachable, failing setup, or refused by
+# its admit command; nothing local changed); otherwise the
 # adapter's own status, or 1 when the copy back failed after it ran. An adapter status of 75 becomes 1, so it never
 # reads as an unavailable executor. TERM or INT while the adapter runs stops its remote process group (TERM, then KILL
 # after 3 seconds) and copies the working files back within 5 seconds, so the partial work survives as it would here.
@@ -53,6 +54,7 @@ mapfile -t run_prefix < <(jq -r '(.run // [])[]' <<<"$executor_json")
 mapfile -t exclude_arguments < <(jq -r '(.exclude // [])[] | "--exclude=\(.)"' <<<"$executor_json")
 mapfile -t rsync_options < <(jq -r '(.rsync_options // [])[]' <<<"$executor_json")
 mapfile -t sync_paths < <(jq -r '(.sync_paths // [])[]' <<<"$executor_json")
+mapfile -t admit < <(jq -r '(.admit // [])[]' <<<"$executor_json")
 
 # AGENTIC_SSH replaces the ssh command, here and as rsync's and git's transport.
 read -r -a ssh_command <<<"${AGENTIC_SSH:-ssh}"
@@ -207,6 +209,14 @@ printf 'remote-run: the %s runs on %s (%s) in %s:%s\n' "$role" "$name" "$destina
 base=$(step 'preparing the executor' remote_script "$PREPARE" "$root" "$mirror" "${directories[@]}" -- "${stale[@]}") || exit "$?"
 base=${base##*$'\n'}
 [[ $base == /* ]] || unavailable "$name: preparing the executor printed no folder"
+
+# The executor's own admission (admit): a host that has no room now sends the ticket back here instead of making
+# the worker wait there.
+if ((${#admit[@]} > 0)); then
+  admit_rc=0
+  remote_script 'exec "$@"' "${admit[@]}" >"$temporary/admit" 2>&1 || admit_rc=$?
+  ((admit_rc == 0)) || unavailable "$name: no room ($(tail -c 200 -- "$temporary/admit" | tr -s '[:space:]' ' ' | sed 's/ $//')${admit_rc:+, admit exited $admit_rc})"
+fi
 
 # 2. Push the ticket's commit and the branches its worker compares against, to the mirror only.
 sha=$(git -C "$worktree" rev-parse HEAD)

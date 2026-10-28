@@ -203,6 +203,26 @@ class RemoteExecutorTests(unittest.TestCase):
         self.assertTrue(self.remote(worktree).is_dir())
         self.assertFalse((self.remote(worktree) / "node_modules").exists())
 
+    def test_an_executor_whose_admit_refuses_sends_the_ticket_back_here(self):
+        full = self.tool(Path(self.temp.name) / "bin" / "full", "#!/usr/bin/env bash\necho 'free=0/7'\nexit 1\n")
+        repo = self.repo(admit=[str(full)])
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        self.run_campaign(repo)
+        self.assertEqual(self.states(repo), {"TST-001": "done"})
+        unavailable = [e["message"] for e in self.events(repo) if e["type"] == "executor-unavailable"]
+        self.assertEqual(len(unavailable), 1)
+        self.assertIn("no room (free=0/7, admit exited 1)", unavailable[0])
+        self.assertEqual(self.run_log(), "")
+
+    def test_an_executor_whose_admit_accepts_runs_the_worker_there(self):
+        room = self.tool(Path(self.temp.name) / "bin" / "room", "#!/usr/bin/env bash\nexit 0\n")
+        repo = self.repo(admit=[str(room)])
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        self.run_campaign(repo)
+        self.assertEqual(self.states(repo), {"TST-001": "done"})
+        self.assertNotIn("executor-unavailable", [e["type"] for e in self.events(repo)])
+        self.assertIn("run.sh worker", self.run_log())
+
     def test_an_unreachable_executor_falls_back_locally_without_spending_an_attempt(self):
         repo = self.repo()
         repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
@@ -322,6 +342,7 @@ class ExecutorSettingsTests(unittest.TestCase):
             "exclude must be a list": {"executors": [dict(good, exclude=[""])]},
             "rsync_options must be a list": {"executors": [dict(good, rsync_options="--chmod=g+w")]},
             "sync_paths must be a list of absolute paths": {"executors": [dict(good, sync_paths=["recordings"])]},
+            "admit must be a list": {"executors": [dict(good, admit="check")]},
             "unknown field": {"executors": [dict(good, worker=2)]},
             "is not unique": {"executors": [good, dict(good, workers=2)]},
         }
