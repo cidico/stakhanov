@@ -172,8 +172,9 @@ done
 # systemd units, rewritten only when they change.
 reload=false
 write_unit() { # FILE CONTENT: true when FILE changed
+  # Compared in bash: cmp (diffutils) is not on every host.
+  if [[ -f $1 && $(<"$1") == "$2" ]]; then return 1; fi
   printf '%s\n' "$2" >"$1.new"
-  if cmp -s "$1.new" "$1"; then rm -f "$1.new"; return 1; fi
   mv -f "$1.new" "$1"
   reload=true
 }
