@@ -159,7 +159,7 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
 "executors": [
   {"name": "build-box", "ssh": "build-box", "workers": 1, "root": "/srv/agentic",
    "run": ["/usr/local/bin/agentic-worker-run"], "exclude": ["node_modules/", "bin/", "obj/"],
-   "rsync_options": ["--chmod=g+w"]}
+   "rsync_options": ["--chmod=g+rwX"]}
 ]
 ```
 
@@ -171,7 +171,7 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
 | `root` | Absolute path on the host under which every local absolute path is mirrored (local `/x/y` lives at `<root>/x/y` there). Empty (the default) means the same paths. |
 | `run` | Optional argv prefix on the host that runs the adapter and presents `<root>/x/y` at `/x/y` to it (for example a container with bind mounts). It receives `env NAME=VALUE... bash <adapter> <role> <worktree> <prompt> <result> <events>` with local paths. Without it, `root` must be empty. |
 | `exclude` | rsync exclude patterns for the worktree sync, both ways (`/.git` is always excluded). Excluded folders are neither sent nor deleted on either side. |
-| `rsync_options` | Extra rsync options for every transfer. |
+| `rsync_options` | Extra rsync options for every transfer. When `run` executes the adapter as another user than the ssh one, give the group access both ways (`--chmod=g+rwX`, with the executor root group-owned or under a default ACL): the engine and its results are owner-only here, and rsync carries the modes. That user must also leave the files it writes readable by the group: the result is written owner-only. |
 
 - Capacity is the local `--workers` plus every executor's `workers`. A starting ticket takes the first executor (in
   settings order) with a free slot, else a local one; the order of the ready tickets (critical path first) does not
