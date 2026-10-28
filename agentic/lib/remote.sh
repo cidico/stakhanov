@@ -163,11 +163,12 @@ executor_reach() {
   [[ $base == /* ]] || unavailable "$name: preparing the executor printed no folder"
 }
 
-# executor_admit UNITS: the commands the executor requires, checked through its run prefix (which receives
-# AGENTIC_UNITS=0: the check needs no capacity), then its own admission (admit, with AGENTIC_UNITS=UNITS): a host that
-# lacks a command or has no room now sends the run back instead of making it wait there.
+# executor_admit UNITS KIND: the commands the executor requires, checked through its run prefix (which receives
+# AGENTIC_UNITS=0: the check needs no capacity), then its own admission (admit, with AGENTIC_UNITS=UNITS and
+# AGENTIC_RUN_KIND=KIND, worker or offload: a worker also needs a model account there): a host that lacks a command or
+# has no room now sends the run back instead of making it wait there.
 executor_admit() {
-  local units=$1 rc=0 missing detail
+  local units=$1 kind=$2 rc=0 missing detail
   if ((${#requires[@]} > 0)); then
     missing=$(remote_script 'exec "$@"' env AGENTIC_UNITS=0 "${run_prefix[@]}" sh -c "$REQUIRES" agentic-requires \
       "${requires[@]}" 2>"$temporary/requires") || rc=$?
@@ -178,7 +179,7 @@ executor_admit() {
   fi
   if ((${#admit[@]} > 0)); then
     rc=0
-    remote_script 'exec "$@"' env "AGENTIC_UNITS=$units" "${admit[@]}" >"$temporary/admit" 2>&1 || rc=$?
+    remote_script 'exec "$@"' env "AGENTIC_UNITS=$units" "AGENTIC_RUN_KIND=$kind" "${admit[@]}" >"$temporary/admit" 2>&1 || rc=$?
     ((rc == 0)) || unavailable "$name: no room ($(tail -c 200 -- "$temporary/admit" | tr -s '[:space:]' ' ' | sed 's/ $//')${rc:+, admit exited $rc})"
   fi
 }

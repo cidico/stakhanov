@@ -102,7 +102,9 @@ partition). A run holds its units as flock locks in `<EXECUTOR_STATE_DIR>/units`
 run waits for units, no new run is admitted, so a large one is never starved by small ones.
 `agentic-executor-admit [N]` (N defaults to `AGENTIC_UNITS`, then `EXECUTOR_WORKER_UNITS`) exits 0 when N units are
 free and nobody waits, else prints `free=F/T waiting=yes|no` and exits 1: the runner then keeps that worker, or runs
-that offloaded command, on its own machine instead of waiting here. `agentic-executor-status` shows the free units,
+that offloaded command, on its own machine instead of waiting here. A worker (`AGENTIC_RUN_KIND=worker`, set by the
+engine) is also refused while every account of `EXECUTOR_ACCOUNTS` is out after a usage limit (`no Claude account until
+HH:MM`), so it runs on the controlling machine's accounts instead of failing here; an offloaded command needs none. `agentic-executor-status` shows the free units,
 every waiting or running run (its units, age and command) and the accounts.
 
 ## Tokens

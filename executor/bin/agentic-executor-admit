@@ -16,6 +16,13 @@ if ((need > EXECUTOR_UNITS)); then
   printf 'asks %s units; this executor has %s\n' "$need" "$EXECUTOR_UNITS"
   exit 1
 fi
+# A worker runs claude: with every account out after a usage limit it would fail here, so it stays home.
+if [[ ${AGENTIC_RUN_KIND:-} == worker && ${#EXECUTOR_ACCOUNT_NAMES[@]} -gt 0 ]] \
+  && ! "$package/accounts/agentic-executor-accounts" account pick >/dev/null 2>&1; then
+  until=$("$package/accounts/agentic-executor-accounts" account next 2>/dev/null) || until=''
+  printf 'no Claude account until %s\n' "$( [[ $until =~ ^[0-9]+$ ]] && date -d "@$until" +%H:%M || echo unknown)"
+  exit 1
+fi
 free=$(executor_units_free) || exit 1
 waiting=no
 if executor_units_waiting; then waiting=yes; fi

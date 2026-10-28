@@ -181,7 +181,7 @@ mirror_for "$worktree"
 prepare() {
   executor_load "$1"
   executor_reach "$(remote_path "$(dirname -- "$worktree")")" --
-  executor_admit "$units"
+  executor_admit "$units" offload
   executor_checkout "$worktree" "$head_ref" "$branch" "${names[@]}"
   executor_sync_worktree "$worktree"
   executor_sync_paths_out

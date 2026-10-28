@@ -66,7 +66,7 @@ class OffloadTests(unittest.TestCase):
         return path.read_text() if path.exists() else ""
 
     def test_a_remote_run_streams_its_output_and_copies_back_only_the_back_paths(self):
-        admit = self.tool("admit", f"#!/usr/bin/env bash\nprintf '%s\\n' \"$AGENTIC_UNITS\" >> {self.root}/admit.log\n")
+        admit = self.tool("admit", f"#!/usr/bin/env bash\nprintf '%s %s\\n' \"$AGENTIC_UNITS\" \"$AGENTIC_RUN_KIND\" >> {self.root}/admit.log\n")
         self.run_prefix = self.tool("units-run", UNITS_RUN)
         repo = self.repo(self.executor(admit=[str(admit)], env={"EXECUTOR_ONLY": "executor"}),
                          project={"env": {"PROJECT_ONLY": "project"}})
@@ -85,7 +85,7 @@ class OffloadTests(unittest.TestCase):
         self.assertEqual((repo.root / "results" / "deep" / "r.txt").read_text(), "result\n")
         self.assertFalse((repo.root / "junk.txt").exists())
         self.assertTrue((self.remote(repo.root) / "junk.txt").is_file())
-        self.assertEqual((self.root / "admit.log").read_text(), "2\n")
+        self.assertEqual((self.root / "admit.log").read_text(), "2 offload\n")
         self.assertEqual((self.root / "units.log").read_text(), "units=2\n")
         self.assertEqual(list((self.root / ".agentic" / "run").glob("*.pgid")), [])
 

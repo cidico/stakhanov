@@ -166,6 +166,16 @@ t 'units: the waiting run gets its units once they are released' wait_for "$work
 wait "$waiter"
 t 'units: the waiting marker goes away' test ! -e "$work/state/units/waiting"
 t 'units: every unit is free again' "$admit" 3
+future=$(($(date +%s) + 7200))
+printf '%s\n' "$future" >"$work/state/accounts/work.out-until"
+t 'admit: a worker is admitted while one account is available' env AGENTIC_RUN_KIND=worker "$admit" 1
+printf '%s\n' "$future" >"$work/state/accounts/personal.out-until"
+OUT=$(AGENTIC_RUN_KIND=worker "$admit" 1)
+t 'admit: a worker is refused while every account is out' [ "$OUT" = "no Claude account until $(date -d "@$future" +%H:%M)" ]
+t 'admit: and the refusal is a failure' not env AGENTIC_RUN_KIND=worker "$admit" 1
+t 'admit: an offloaded command needs no account' env AGENTIC_RUN_KIND=offload "$admit" 1
+t 'admit: a run of no kind needs no account (older engines)' "$admit" 1
+rm -f "$work/state/accounts/"*.out-until
 OUT=$("$status")
 t 'status: free units and accounts' bash -c 'has_line() { grep -Fxq -- "$2" <<<"$1"; }; has_line "$1" "free=3/3 waiting=no" && has_line "$1" "account work: ready"' _ "$OUT"
 

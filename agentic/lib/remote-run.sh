@@ -94,7 +94,7 @@ printf 'remote-run: the %s runs on %s (%s) in %s:%s\n' "$role" "$name" "$destina
 # 1. Reach the host and prepare the mirror and the folders; then its required commands and its own admission (admit):
 # a host that has no room now sends the ticket back here instead of making the worker wait there.
 executor_reach "${directories[@]}" -- "${stale[@]}"
-executor_admit "$worker_units"
+executor_admit "$worker_units" worker
 
 # 2. Push the ticket's commit and the branches its worker compares against, to the mirror only, and check that commit
 # out in the remote worktree with the campaign and main branches next to it.

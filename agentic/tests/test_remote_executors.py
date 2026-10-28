@@ -243,13 +243,13 @@ class RemoteExecutorTests(unittest.TestCase):
 
     def test_worker_units_reach_the_admit_command_and_the_run_prefix(self):
         admit = self.tool(Path(self.temp.name) / "bin" / "admit",
-                          f"#!/usr/bin/env bash\nprintf '%s\\n' \"$AGENTIC_UNITS\" >> {self.root}/admit.log\n")
+                          f"#!/usr/bin/env bash\nprintf '%s %s\\n' \"$AGENTIC_UNITS\" \"$AGENTIC_RUN_KIND\" >> {self.root}/admit.log\n")
         run = self.tool(Path(self.temp.name) / "bin" / "units-run", UNITS_RUN)
         repo = self.repo(admit=[str(admit)], run=[str(run), str(self.root)], worker_units=3, requires=["git"])
         repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
         self.run_campaign(repo)
         self.assertEqual(self.states(repo), {"TST-001": "done"})
-        self.assertEqual((self.root / "admit.log").read_text(), "3\n")
+        self.assertEqual((self.root / "admit.log").read_text(), "3 worker\n")
         # The required commands are checked through the run prefix with no units, then the worker takes its three.
         self.assertEqual((self.root / "units.log").read_text(), "units=0\nunits=3\n")
         self.assertIn("run.sh worker", self.run_log())

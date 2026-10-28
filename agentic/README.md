@@ -52,7 +52,8 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `AGENTIC_SSH` | The ssh command for the executors (default `ssh`), also rsync's `-e` and git's transport. It is split on spaces, so it may carry options. |
 | `AGENTIC_OFFLOAD`, `AGENTIC_EXECUTOR_RUN` | Set to `1`, `bin/offload` runs its command on this machine: it already is an offloaded command (`AGENTIC_OFFLOAD`, which `offload` sets) or an executor run (`AGENTIC_EXECUTOR_RUN`, which the executor package's run prefix sets). |
 
-The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters, and `AGENTIC_UNITS` for an executor's `admit` and `run` (see
+The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters, `AGENTIC_UNITS` for an executor's `admit` and `run`, and
+`AGENTIC_RUN_KIND` (`worker` or `offload`) for its `admit` (see
 [Remote executors](#remote-executors)); they are not settings.
 
 ## Starting a campaign
@@ -177,7 +178,7 @@ of a host: see its `README.md`.
 | `root` | Absolute path on the host under which every local absolute path is mirrored (local `/x/y` lives at `<root>/x/y` there). Empty (the default) means the same paths. |
 | `run` | Optional argv prefix on the host that runs the adapter and presents `<root>/x/y` at `/x/y` to it (for example a container with bind mounts). It receives `env NAME=VALUE... bash <adapter> <role> <worktree> <prompt> <result> <events>` with local paths (an offloaded command: `env NAME=VALUE... bash -c <cd and exec> offload <folder> <command>...`), and `AGENTIC_UNITS=<n>` in its own environment: the units the run takes. Without it, `root` must be empty. |
 | `exclude` | rsync exclude patterns for the worktree sync, both ways (`/.git` is always excluded). Excluded folders are neither sent nor deleted on either side. |
-| `admit` | Optional argv run on the host before each remote invocation, as `env AGENTIC_UNITS=<n> <admit>...`. A non-zero exit means the host has no room now for `n` units: the ticket runs here for the rest of its run (`executor-unavailable`, no attempt spent) instead of waiting there. Useful when several runners share one host. |
+| `admit` | Optional argv run on the host before each remote invocation, as `env AGENTIC_UNITS=<n> AGENTIC_RUN_KIND=worker\|offload <admit>...`. A non-zero exit means the host has no room now for `n` units (or, for a worker, no model account it can use): the ticket runs here for the rest of its run (`executor-unavailable`, no attempt spent) instead of waiting there. Useful when several runners share one host. |
 | `worker_units` | Positive integer, default 1: the units (`AGENTIC_UNITS`) a worker invocation asks of `admit` and `run`. What a unit is belongs to the host (the executor package counts them against its capacity). |
 | `requires` | Optional list of command names checked on the host before each remote invocation, through `run` (with `AGENTIC_UNITS=0`, so it takes no units): `[run...] sh -c 'command -v NAME'`. A missing one makes the executor unavailable (`requires NAME`) for that run, as an unreachable one. |
 | `env` | Optional string map exported only into the runs on this executor, after the `AGENTIC_*` variables and the project's `env` keys, so it wins over them. The same names as in the project's `env` are refused. |
