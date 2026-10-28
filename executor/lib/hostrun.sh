@@ -12,8 +12,9 @@ executor_host_run() {
   while (($#)) && [[ $1 != -- ]]; do environment+=("$1"); shift; done
   (($#)) && shift
   for path in "${EXECUTOR_BINDS[@]}"; do
-    install -d -m 755 -- "$path"
-    install -d -- "$EXECUTOR_ROOT$path"
+    # Created only when missing: install -d resets the mode of a folder that exists (install.sh sets these up).
+    [[ -d $path ]] || install -d -m 755 -- "$path"
+    [[ -d $EXECUTOR_ROOT$path ]] || install -d -m 2770 -g "$EXECUTOR_GROUP" -- "$EXECUTOR_ROOT$path"
     bind+=("$EXECUTOR_ROOT$path" "$path")
   done
   bind=(unshare --mount --propagation private -- sh -c \
