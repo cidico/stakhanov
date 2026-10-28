@@ -350,11 +350,32 @@ class SpecSectionTests(RepoCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(section, result.stderr)
 
-    def test_the_old_section_set_is_not_enough(self):
-        old = "# Old\n" + "".join(f"## {name}\nx\n" for name in ("Problem", "Goals", "Non-goals", "Decisions", "Requirements", "Constraints", "Acceptance")) + "## Open questions\nNone.\n"
-        result = self.init(old)
+    LEGACY = ("Problem", "Goals", "Non-goals", "Decisions", "Requirements", "Constraints", "Acceptance")
+
+    def legacy(self, questions="None.", sections=LEGACY):
+        return "# Old\n" + "".join(f"## {name}\nx\n" for name in sections) + f"## Open questions\n{questions}\n"
+
+    def test_the_legacy_section_set_is_accepted(self):
+        for questions in ("None.", "Nenhuma.", "Nenhuma", "- non-blocking: naming"):
+            with self.subTest(questions=questions):
+                self.assertEqual(self.init(self.legacy(questions)).returncode, 0)
+
+    def test_the_legacy_set_still_needs_every_section_and_settled_questions(self):
+        for spec in (self.legacy(sections=self.LEGACY[:-1]), self.legacy("Which database?")):
+            with self.subTest(spec=spec):
+                self.assertNotEqual(self.init(spec).returncode, 0)
+
+    def test_sections_of_the_two_sets_do_not_combine(self):
+        mixed = SPEC.replace("## User Stories\n", "## Goals\n").replace("## Out of Scope\n", "## Non-goals\n")
+        result = self.init(mixed)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Problem Statement", result.stderr)
+        self.assertIn("User Stories", result.stderr)
+        self.assertIn("Out of Scope", result.stderr)
+
+    def test_nenhuma_is_only_the_legacy_wording(self):
+        result = self.init(SPEC.replace("None.", "Nenhuma."))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Open questions", result.stderr)
 
     def test_open_questions_accept_none_or_non_blocking_only(self):
         self.assertEqual(self.init(SPEC.replace("None.", "- non-blocking: naming of the flag")).returncode, 0)
@@ -483,6 +504,26 @@ class DefectTests(RepoCase):
         repo.env.update(MOCK_APPEND_FILE="text.txt", MOCK_APPEND_TEXT="two \\n")
         repo.command("run", "--provider", "mock", cwd=repo.worktree)
         self.assertEqual(self.states(repo), {"TST-001": "todo"})
+
+    def test_a_legacy_plan_without_final_uses_campaign_expensive_as_its_final_list(self):
+        repo = self.repo(settings={"required_checks": [CHEAP]})
+        repo.init_campaign(); repo.configure([ticket(status="done")])
+        (repo.root / "SPEC.md").unlink(missing_ok=True)
+        counter = Path(repo.cache.name) / "final-runs"
+        legacy = ["sh", "-c", f"echo run >> {counter}"]
+        self.edit_plan(repo, lambda plan: (plan.pop("final"), plan.update(campaign_expensive=[CHEAP, legacy])))
+        self.assertIn("verified", repo.command("verify", cwd=repo.worktree).stdout)
+        result = repo.command("finalize", cwd=repo.worktree, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(counter.read_text().splitlines(), ["run"])
+
+    def test_a_plan_without_final_or_campaign_expensive_is_refused(self):
+        repo = self.repo()
+        repo.init_campaign(); repo.configure([ticket()])
+        self.edit_plan(repo, lambda plan: plan.pop("final"))
+        result = repo.command("verify", cwd=repo.worktree, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed", result.stderr)
 
     def test_a_fixed_validation_plan_applies_when_finalize_resumes(self):
         repo = self.repo()

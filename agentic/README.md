@@ -25,6 +25,7 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `required_checks` | Argv arrays that every ticket's `cheap` phase and the plan's `final` list must contain; `campaign verify` refuses a plan without them, and finalize checks again before the final validation. |
 | `timezone` | Display zone for local times. Precedence: `AGENTIC_DISPLAY_TZ`, then this field, then the system zone. |
 | `archive_dir` | Where finalize archives the campaign history, relative to the main worktree, with `{date}` and `{slug}` placeholders; used only when Git ignores it. Default: the `archive/` folder of the cache. |
+| `executors` | Remote machines that run workers; see [Remote executors](#remote-executors). Default: none, every role runs on this machine. |
 
 ### Environment variables
 
@@ -46,6 +47,9 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `AGENTIC_CODEX_EFFORT`, `AGENTIC_CODEX_{WORKER,REVIEWER,DIAGNOSTICIAN}_EFFORT` | Codex effort (default `medium` for workers, `high` for the others). |
 | `AGENTIC_GROK_MODEL` | Grok model; unset means the CLI default. |
 | `AGENTIC_GROK_EFFORT`, `AGENTIC_GROK_{WORKER,REVIEWER,DIAGNOSTICIAN}_EFFORT` | Grok effort (default `medium` for workers, `high` for the others). |
+| `AGENTIC_CLAUDE_ACCOUNTS` | Account hook command of the Claude adapter (for example `udarnik`); see `providers/claude/README.md`. Unset: claude runs in the caller's account. |
+| `AGENTIC_EXECUTORS` | `local` runs every worker on this machine whatever `executors` declares. Any other non-empty value is an error. |
+| `AGENTIC_SSH` | The ssh command for the executors (default `ssh`), also rsync's `-e` and git's transport. It is split on spaces, so it may carry options. |
 
 The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters; it is not a setting.
 
@@ -58,13 +62,15 @@ spec's first `# ` heading; there is no fallback to the file name, and `init` sto
 first), and `campaign queue start` refuses the same way. `.agentic/SPEC.md` has the spec contract and
 `.agentic/TICKET.md` the tickets; `campaign verify` checks both and the validation plan.
 
-Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid` and the usual coreutils. Linux only.
+Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid` and the usual coreutils (plus `ssh` and
+`rsync` for remote executors). Linux only.
 
 ## Scheduling
 
 - `campaign run --workers 1..3` (default 2) starts write workers for tickets whose dependencies are
   `done` and whose collision domains are disjoint from running tickets. Ready tickets start in order of
   how many unfinished tickets they unblock transitively (the critical path first), then by ticket id.
+  With [remote executors](#remote-executors) the capacity is `--workers` plus every executor's `workers`.
 - Blocked or `needs-human` tickets do not stop independent tickets; the runner pauses only when
   nothing else can run.
 - Runtime state, prompts, results, receipts, and logs live in the campaign cache
@@ -125,7 +131,8 @@ Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid` and the usu
   activity is not proof of progress and never extends the deadline.
 - A usage-limit failure is an ordinary provider failure: the invocation is repeated once, then `harness-error`
   pauses the ticket with its delta preserved. The runner does not wait for the limit to reset; recover the
-  ticket (`campaign recover`) once it has.
+  ticket (`campaign recover`) once it has. With `AGENTIC_CLAUDE_ACCOUNTS` the Claude adapter first retries once
+  in another account (`providers/claude/README.md`).
 - Validation commands have no deadline. A stuck test holds its phase until someone kills it; find the process in
   the runner's process tree. The deadlines above limit only provider invocations.
 
@@ -142,6 +149,67 @@ Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid` and the usu
 - `campaign run`, `campaign finalize` and `campaign queue start` drop to the lowest CPU priority (nice 19), and the
   detached engine and queue run in the user's `background.slice` (`agentic-<kind>-<slug>-<pid>.scope`), so tests
   only take the CPU the rest of the machine leaves free. Without a working user systemd (CI) only the priority applies.
+
+## Remote executors
+
+A project can let other machines run workers. Everything else stays on this machine: worktrees, commits,
+validation, reviewers, diagnosticians and integration. Declare them in `project.json`:
+
+```json
+"executors": [
+  {"name": "build-box", "ssh": "build-box", "workers": 1, "root": "/srv/agentic",
+   "run": ["/usr/local/bin/agentic-worker-run"], "exclude": ["node_modules/", "bin/", "obj/"],
+   "rsync_options": ["--chmod=g+w"]}
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | `[a-z0-9-]+`, unique; `local` is reserved for this machine. |
+| `ssh` | ssh destination or alias. Batch mode: the host must accept a key without prompts. |
+| `workers` | Positive integer: tickets this executor runs at once. |
+| `root` | Absolute path on the host under which every local absolute path is mirrored (local `/x/y` lives at `<root>/x/y` there). Empty (the default) means the same paths. |
+| `run` | Optional argv prefix on the host that runs the adapter and presents `<root>/x/y` at `/x/y` to it (for example a container with bind mounts). It receives `env NAME=VALUE... bash <adapter> <role> <worktree> <prompt> <result> <events>` with local paths. Without it, `root` must be empty. |
+| `exclude` | rsync exclude patterns for the worktree sync, both ways (`/.git` is always excluded). Excluded folders are neither sent nor deleted on either side. |
+| `rsync_options` | Extra rsync options for every transfer. |
+
+- Capacity is the local `--workers` plus every executor's `workers`. A starting ticket takes the first executor (in
+  settings order) with a free slot, else a local one; the order of the ready tickets (critical path first) does not
+  change. The engine emits `executor-assigned` (`executor=<name>`) and keeps the choice in
+  `<runtime>/state/<ticket>.executor` for the ticket's run. `campaign status` and `campaign overview` show the
+  executor of every in-progress ticket (`local` included).
+- Every worker-role invocation of that ticket (worker, repair, recovery, review repair, integration repair) runs on
+  its executor through `lib/remote-run.sh`, under the same deadline. Reviewers and diagnosticians always run here.
+- One remote invocation: reach the host; push the ticket's commit, `campaign/<slug>` and the main branch with
+  `git push --force` to a bare mirror at `<root>/.agentic/mirror/<repo>-<hash>.git` (the remote home when `root` is
+  empty), never anywhere else; check that commit out in `<root><worktree>` with the campaign and main branches next to
+  it; rsync the working files (`--delete`, uncommitted changes and deletions included), the engine, the prompt and the
+  ticket's events; run the adapter in its own process group; copy the result, the events and the working files back.
+  The adapter receives every `AGENTIC_*` variable (except `AGENTIC_SSH` and `AGENTIC_EXECUTORS`), the `env` keys of
+  `project.json` and the runner's git settings, with its worktree marked `safe.directory`.
+- When the executor fails before the adapter starts (ssh, mirror push, checkout or sync), the engine emits
+  `executor-unavailable` with the reason, runs that ticket here for the rest of the run, and repeats the invocation
+  at once without spending one of its two attempts. The ticket keeps its executor slot, so this machine may run up
+  to the whole capacity while an executor is down. A later ticket tries the executor again. Once the adapter started,
+  every status is the adapter's (an adapter exit 75 is reported as 1), and a failed copy back is a failure (1).
+- On a deadline the runner stops the remote process group (TERM, then KILL after 3 seconds) and copies the working
+  files back within 5 seconds, so the partial work survives as a local worker's would. When that copy does not finish,
+  the work stays in `<root><worktree>` until the next remote invocation of the ticket replaces it.
+- The host needs `bash`, `git`, `rsync` and `setsid`; the adapter's own commands (`claude`, `jq`, `python3`...)
+  must exist where `run` runs it. Each invocation opens about ten ssh connections: an `ssh_config` with
+  `ControlMaster auto` and `ControlPersist` for the host makes them cheap.
+- `AGENTIC_EXECUTORS=local` runs everything here. The mirror and the remote worktrees are never pruned.
+- `campaign-watch` measures the CPU of local processes only: a remote worker that writes no event for longer than
+  `--stall-minutes` wakes the coordinator as a silent provider.
+
+## Legacy campaign layout (accepted, not produced)
+
+Campaigns created before the kit keep running and finalizing; the kit never writes this layout.
+
+- A SPEC may carry, instead of the current sections, every one of `Problem`, `Goals`, `Non-goals`, `Decisions`,
+  `Requirements`, `Constraints`, `Acceptance` and `Open questions`. Sections of the two layouts never combine to
+  complete one. With the legacy sections, `Open questions` may also read `Nenhuma`.
+- A validation plan without `final` uses its plan-level `campaign_expensive` list as the final list.
 
 ## Campaign queue
 

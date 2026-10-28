@@ -31,6 +31,9 @@ PROJECT_CONFIG_SOURCE=$PROJECT_CONFIG
 PROJECT_NAME='' PROJECT_TIMEZONE='' PROJECT_ARCHIVE_DIR=''
 PROJECT_INSTRUCTION_FILES=(AGENTS.md CLAUDE.md)
 PROJECT_REQUIRED_CHECKS='[]'
+PROJECT_ENV_KEYS=()
+# Remote machines that run workers (a JSON list); AGENTIC_EXECUTORS=local empties it.
+PROJECT_EXECUTORS='[]'
 
 # The branch campaigns branch from and are finalized into: the main_branch of the local project.json, else main, else master.
 resolve_main_branch() {
@@ -49,6 +52,39 @@ resolve_main_branch() {
   printf '%s\n' "$branch"
 }
 MAIN_BRANCH=$(resolve_main_branch)
+
+# The executors list of the settings, checked entry by entry so the error names the field. Missing optional fields
+# are filled in (root "", empty lists) and a trailing slash of root is dropped.
+load_executors() {
+  local error
+  error=$(jq -r '
+    def strings: type == "array" and all(.[]; type == "string" and length > 0);
+    def fail($i; $message): "executor \($i + 1)\(if (.name | type) == "string" then " (\(.name))" else "" end): \($message)";
+    (.executors // []) as $list
+    | if ($list | type) != "array" then "executors must be a list"
+      else
+        ([$list | to_entries[] | .key as $i | .value
+          | if type != "object" then "executor \($i + 1): must be an object"
+            elif (keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options"]) != [] then
+              fail($i; "unknown field \((keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options"])[0])")
+            elif (.name | type) != "string" or (.name | test("^[a-z0-9-]+$") | not) then fail($i; "name must match [a-z0-9-]+")
+            elif .name == "local" then fail($i; "the name local is reserved for this machine")
+            elif (.ssh | type) != "string" or (.ssh | test("^[^-\\s]\\S*$") | not) then fail($i; "ssh must be an ssh destination or alias")
+            elif (.workers | type) != "number" or .workers < 1 or .workers != (.workers | floor) then fail($i; "workers must be a positive integer")
+            elif (.root // "" | type) != "string" or (.root // "" | . == "" or startswith("/") | not) then fail($i; "root must be an absolute path or empty")
+            elif .run != null and (.run | strings | not) then fail($i; "run must be a list of non-empty strings")
+            elif (.run // []) == [] and (.root // "" | sub("/+$"; "")) != "" then
+              fail($i; "root needs a run prefix that presents <root>/x at /x; without run the remote paths are the local ones")
+            elif .exclude != null and (.exclude | strings | not) then fail($i; "exclude must be a list of non-empty strings")
+            elif .rsync_options != null and (.rsync_options | strings | not) then fail($i; "rsync_options must be a list of non-empty strings")
+            else empty end]
+         + [$list | map(objects | .name) | group_by(.)[] | select(length > 1) | "executor name \(.[0]) is not unique"])
+        | first // empty
+      end' <<<"$1") || die "invalid executors in $PROJECT_CONFIG_SOURCE"
+  [[ -z $error ]] || die "invalid executors in $PROJECT_CONFIG_SOURCE: $error"
+  PROJECT_EXECUTORS=$(jq -c '[(.executors // [])[]
+    | .root = (.root // "" | sub("/+$"; "")) | .run = (.run // []) | .exclude = (.exclude // []) | .rsync_options = (.rsync_options // [])]' <<<"$1")
+}
 
 load_project_config() {
   local key value config
@@ -69,6 +105,7 @@ load_project_config() {
     and (.env == null or (.env | type == "object" and all(.[]; type == "string")))
     and (.required_checks == null or (.required_checks | type == "array" and all(.[]; argv)))
   ' <<<"$config" >/dev/null || die "invalid settings in $PROJECT_CONFIG_SOURCE (see project.json.example)"
+  load_executors "$config"
   PROJECT_NAME=$(jq -r '.name // ""' <<<"$config")
   PROJECT_TIMEZONE=$(jq -r '.timezone // ""' <<<"$config")
   PROJECT_ARCHIVE_DIR=$(jq -r '.archive_dir // ""' <<<"$config")
@@ -78,7 +115,8 @@ load_project_config() {
   fi
   # Exported for the runner, the workers and the validation commands; the environment always wins. Variables that would
   # redirect the runner itself are refused.
-  while IFS= read -r key; do
+  mapfile -t PROJECT_ENV_KEYS < <(jq -r '(.env // {}) | keys[]' <<<"$config")
+  for key in "${PROJECT_ENV_KEYS[@]}"; do
     [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid environment variable name in $PROJECT_CONFIG_SOURCE: $key"
     case $key in
       PATH|HOME|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|PS4|GIT_*|LD_*|PYTHON*)
@@ -87,11 +125,17 @@ load_project_config() {
     [[ -z ${!key+x} ]] || continue
     value=$(jq -r --arg key "$key" '.env[$key]' <<<"$config")
     export "$key=$value"
-  done < <(jq -r '(.env // {}) | keys[]' <<<"$config")
+  done
   # Display time zone: AGENTIC_DISPLAY_TZ, then the settings, then the system zone (TZ is never set).
   if [[ -z ${AGENTIC_DISPLAY_TZ:-} && -n $PROJECT_TIMEZONE ]]; then export AGENTIC_DISPLAY_TZ=$PROJECT_TIMEZONE; fi
 }
 load_project_config
+# AGENTIC_EXECUTORS=local runs every worker on this machine, whatever the settings declare.
+case ${AGENTIC_EXECUTORS:-} in
+  '') ;;
+  local) PROJECT_EXECUTORS='[]' ;;
+  *) die "AGENTIC_EXECUTORS accepts only 'local' (every worker on this machine)" ;;
+esac
 
 current_branch() {
   git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || return 1

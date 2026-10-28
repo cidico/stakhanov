@@ -2,10 +2,11 @@
 # Waits until an unattended campaign needs its coordinator, prints why, and exits 0.
 #
 #   campaign-watch [--slug SLUG] [--until TICKET=STATUS]... [--stall-minutes N] [--max-minutes N]
-#                  [--ignore-required-done]
+#                  [--ignore-required-done] [--ignore TICKET]...
 #
 # It returns only for: runner stopped, pending decision, blocked ticket, needs-human ticket whose
-# dependencies are done, a provider timeout or harness error after it started, a provider with no event
+# dependencies are done (except the ones passed to --ignore, already waiting on the owner), a provider
+# timeout or harness error after it started, a provider with no event
 # and no CPU use for longer than --stall-minutes (default 45), a --until milestone, or every required
 # ticket done (skip that with --ignore-required-done while an optional ticket still runs; the runner
 # stopping still wakes). Otherwise it returns after --max-minutes (default 115) with a ROUTINE line;
@@ -16,7 +17,7 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 campaign="$root/.agentic/bin/campaign"
 slug='' stall=45 max=115 ignore_done=0
-until=()
+until=() ignore=()
 while (($#)); do
   case $1 in
     --slug) slug=$2; shift 2 ;;
@@ -24,7 +25,8 @@ while (($#)); do
     --stall-minutes) stall=$2; shift 2 ;;
     --max-minutes) max=$2; shift 2 ;;
     --ignore-required-done) ignore_done=1; shift ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --ignore) ignore+=("$2"); shift 2 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "campaign-watch: unknown option $1" >&2; exit 64 ;;
   esac
 done
@@ -40,6 +42,7 @@ for c in json.load(sys.stdin)["campaigns"]:
 cache=$(dirname -- "$(dirname -- "$worktree")")
 events="$cache/events"
 until_csv=$(IFS=,; echo "${until[*]-}")
+ignore_csv=$(IFS=,; echo "${ignore[*]-}")
 
 # CPU ticks spent by this campaign's provider adapters and everything under them, or nothing when none runs.
 # The event files only change when a role starts or ends, so a worker deep in a long build or test looks
@@ -112,8 +115,9 @@ if data.get("decisions"):
     why.append("decision pending")
 why += ["%s blocked" % k for k, v in status.items() if v == "blocked"]
 # A checkpoint planned as needs-human waits for its dependencies before the coordinator can act on it.
+ignored = set(filter(None, sys.argv[3].split(",")))
 why += ["%s needs-human" % k for k, v in status.items()
-        if v == "needs-human" and all(status.get(d) == "done" for d in depends[k])]
+        if v == "needs-human" and k not in ignored and all(status.get(d) == "done" for d in depends[k])]
 for item in filter(None, sys.argv[1].split(",")):
     ticket, _, wanted = item.partition("=")
     if status.get(ticket) == wanted:
@@ -121,7 +125,7 @@ for item in filter(None, sys.argv[1].split(",")):
 if sys.argv[2] == "0" and all(v == "done" for k, v in status.items() if required[k]):
     why.append("every required ticket done")
 print("; ".join(why))
-' "$until_csv" "$ignore_done") || reasons='status unreadable'
+' "$until_csv" "$ignore_done" "$ignore_csv") || reasons='status unreadable'
   parked=$(parked_since)
   [[ -z $parked ]] || reasons=${reasons:+$reasons; }$parked
   if [[ -n $reasons ]]; then

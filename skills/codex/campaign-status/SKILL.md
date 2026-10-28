@@ -8,7 +8,8 @@ lists every campaign in the runner cache and every campaign queue.
 
 Report in the user's language as a short board, never raw logs or JSON:
 
-- Per campaign: `done/total` tickets, tickets in progress, runner active or inactive.
+- Per campaign: `done/total` tickets, tickets in progress (with their `executor` when it is not `local`), runner
+  active or inactive.
 - Every `blocked` or `needs-human` ticket with its reason in one line (from the latest `ticket-blocked`,
   `ticket-needs-human`, `integration-conflict` or `base-red` event), and every pending decision with its
   options.

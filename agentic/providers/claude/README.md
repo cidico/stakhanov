@@ -25,4 +25,13 @@ adapter uses and parses the exact non-interrupting invocation through `--help`, 
 Claude Code 2.1.285 was validated with real worker and reviewer invocations: the worker ran shell
 commands and edited files, and the reviewer read the diff without changing the worktree.
 
+Account hook (compatible with udarnik's `account` commands): when `AGENTIC_CLAUDE_ACCOUNTS` names a command and
+`<command> account enabled` exits 0, claude runs in the account that `<command> account current` prints, through the env
+prefix of `<command> account env ACCOUNT`. When claude fails, its output goes to `<command> account limit ACCOUNT` on
+stdin. If that was a usage limit and the hook prints another account, the same invocation (same arguments and model)
+runs once more there, with the provider event `account` naming both accounts (and, for a worker, a note in the prompt
+that the cut-off process left partial, unverified work); a second failure is reported to the hook but not retried. Exit 75 from the hook
+means no account is left, and any other status means it was not a usage limit: the role fails as it does without the
+hook. A missing command, a disabled hook or an unusable account leaves claude in the caller's account.
+
 The runner prompt names the project's instruction files, so no Claude-specific project rule exists.

@@ -362,6 +362,87 @@ assert_command 'A usage limit fails the role and the real error reaches stderr' 
   "$runtime/limit-result.json" "$runtime/limit-events.jsonl" "$mock_bin" \
   "$kit/providers/claude/run.sh" "$workspace" "$runtime/prompt.md" "$runtime/limit-stderr"
 
+# Account hook (AGENTIC_CLAUDE_ACCOUNTS, udarnik-compatible): a fake claude out of quota in the accounts listed in
+# HOOK_LIMITED, and a fake hook command that switches from account A to account B.
+hook_bin="$test_root/hook-bin"
+hook_calls="$test_root/hook-calls"
+hook_home="$test_root/hook-home"
+mkdir -p "$hook_bin" "$hook_calls" "$hook_home"
+hook_a="$hook_home/.claude-a"
+hook_b="$hook_home/.claude-b two"
+cat > "$hook_bin/claude" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ " $* " != *" --help "* ]] || exit 0
+number=$(( $(find "$HOOK_CALLS" -name '*.args' | wc -l) + 1 ))
+printf '%s\n' "$@" > "$HOOK_CALLS/$number.args"
+printf '%s\n' "${CLAUDE_CONFIG_DIR-UNSET}" > "$HOOK_CALLS/$number.config"
+cat > "$HOOK_CALLS/$number.prompt"
+if [[ ${HOOK_OTHER_ERROR:-} == 1 ]]; then
+  printf '{"type":"result","subtype":"success","is_error":true,"result":"API Error: overloaded"}\n'
+  exit 1
+fi
+if [[ ${HOOK_LIMIT_ALL:-} == 1 || ${CLAUDE_CONFIG_DIR-} == "${HOOK_LIMITED:-none}" ]]; then
+  printf '{"type":"result","subtype":"success","is_error":true,"result":"You have hit your weekly limit"}\n'
+  exit 1
+fi
+jq -cn --slurpfile result "$MOCK_RESULT" '{type:"result",subtype:"success",structured_output:$result[0]}'
+MOCK
+cat > "$hook_bin/accounts" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$HOOK_CALLS/hook.log"
+case "$1 $2" in
+  'account enabled') [[ ${HOOK_ENABLED:-1} == 1 ]] ;;
+  'account current') printf '%s\n' "$HOOK_A" ;;
+  'account env')
+    if [[ $3 == "$HOME/.claude" ]]; then printf 'env -u CLAUDE_CONFIG_DIR\n'; else printf 'env CLAUDE_CONFIG_DIR=%q\n' "$3"; fi ;;
+  'account limit')
+    text=$(cat)
+    printf '%s' "$text" > "$HOOK_CALLS/limit-$(basename -- "$3").txt"
+    grep -qi 'hit your .*limit' <<<"$text" || exit 1
+    [[ ${HOOK_NONE_LEFT:-0} != 1 && $3 == "$HOOK_A" ]] || exit 75
+    printf '%s\n' "$HOOK_B" ;;
+  *) exit 64 ;;
+esac
+MOCK
+chmod +x "$hook_bin/claude" "$hook_bin/accounts"
+hook_run() { # <name> [extra env...]: a claude worker with the hook; leaves hook-<name>-{result.json,events.jsonl,stderr}
+  local name=$1
+  shift
+  rm -rf "$hook_calls" && mkdir -p "$hook_calls"
+  rm -f "$runtime/hook-$name-result.json" "$runtime/hook-$name-events.jsonl"
+  env -u CLAUDE_CONFIG_DIR HOME="$hook_home" PATH="$hook_bin:/usr/bin:/bin" AGENTIC_CLAUDE_ACCOUNTS=accounts \
+    HOOK_CALLS="$hook_calls" HOOK_A="$hook_a" HOOK_B="$hook_b" MOCK_RESULT="$runtime/worker.json" "$@" \
+    "$kit/providers/claude/run.sh" worker "$workspace" "$runtime/prompt.md" \
+    "$runtime/hook-$name-result.json" "$runtime/hook-$name-events.jsonl" 2> "$runtime/hook-$name-stderr"
+}
+hook_calls_count() { find "$hook_calls" -name '*.args' | wc -l; }
+export -f hook_run hook_calls_count
+export hook_calls hook_a hook_b hook_home hook_bin runtime workspace kit
+assert_command 'Account hook: claude runs in the account the hook names' \
+  bash -c 'hook_run current && [[ $(hook_calls_count) == 1 && $(cat "$1/1.config") == "$2" ]] && python3 "$3/providers/validate-result.py" "$3/RESULT.schema.json" worker "$4"' _ \
+  "$hook_calls" "$hook_a" "$kit" "$runtime/hook-current-result.json"
+assert_command 'Account hook: a usage limit retries once in the next account with the same arguments' \
+  bash -c 'hook_run limit HOOK_LIMITED="$2" && [[ $(hook_calls_count) == 2 && $(cat "$1/1.config") == "$2" && $(cat "$1/2.config") == "$3" ]] && cmp -s "$1/1.args" "$1/2.args" && grep -q "hit your weekly limit" "$1/limit-.claude-a.txt" && python3 "$4/providers/validate-result.py" "$4/RESULT.schema.json" worker "$5"' _ \
+  "$hook_calls" "$hook_a" "$hook_b" "$kit" "$runtime/hook-limit-result.json"
+assert_command 'Account hook: the retry event names both accounts and only the retry hears about the cut-off work' \
+  bash -c 'jq -e -s "any(.[]; .state == \"account\" and (.message | test(\"account claude-a hit its usage limit; retrying once in account claude-b two\")))" "$1" >/dev/null && ! grep -q "cut off by a provider usage limit" "$2/1.prompt" && grep -q "cut off by a provider usage limit" "$2/2.prompt"' _ \
+  "$runtime/hook-limit-events.jsonl" "$hook_calls"
+assert_command 'Account hook: exit 75 (no account left) fails the role as before' \
+  bash -c 'hook_run none HOOK_LIMITED="$2" HOOK_NONE_LEFT=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 1 && ! -e $3 ]] && grep -q "hit your weekly limit" "$4" && jq -e -s "any(.[]; .state == \"account\" and (.message | test(\"no other account\")))" "$5" >/dev/null' _ \
+  "$hook_calls" "$hook_a" "$runtime/hook-none-result.json" "$runtime/hook-none-stderr" "$runtime/hook-none-events.jsonl"
+assert_command 'Account hook: a second usage limit is reported to the hook but not retried' \
+  bash -c 'hook_run all HOOK_LIMIT_ALL=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 2 && $(grep -c "^account limit" "$1/hook.log") == 2 ]]' _ "$hook_calls"
+assert_command 'Account hook: a failure that is not a usage limit is not retried' \
+  bash -c 'hook_run other HOOK_OTHER_ERROR=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 1 ]] && grep -q "overloaded" "$2"' _ \
+  "$hook_calls" "$runtime/hook-other-stderr"
+assert_command 'Account hook disabled: claude keeps the caller account and a limit is not retried' \
+  bash -c 'hook_run off HOOK_ENABLED=0 HOOK_LIMIT_ALL=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 1 && $(cat "$1/1.config") == UNSET ]] && ! grep -q "^account limit" "$1/hook.log"' _ "$hook_calls"
+assert_command 'Account hook missing: claude runs as today' \
+  bash -c 'hook_run missing AGENTIC_CLAUDE_ACCOUNTS=no-such-hook && [[ $(hook_calls_count) == 1 && $(cat "$1/1.config") == UNSET ]] && grep -q "account hook no-such-hook not found" "$2"' _ \
+  "$hook_calls" "$runtime/hook-missing-stderr"
+
 printf '#!/usr/bin/env bash\nexit 9\n' > "$mock_bin/claude"
 chmod +x "$mock_bin/claude"
 assert_command 'Failed provider leaves no canonical result or raw secret output' \

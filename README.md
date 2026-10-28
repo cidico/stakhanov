@@ -42,6 +42,8 @@ the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.m
   installer installs the missing ones (see below); with `--no-machine-setup` you provide them.
 - At least one provider CLI: `claude`, `codex` or `grok`. The installer installs it when it is missing.
 - Optional: a working user systemd, so the engine runs in the user's `background.slice`.
+- Optional: `ssh` and `rsync`, here and on the hosts, to run workers on remote executors (`executors` in
+  `.agentic/project.json`).
 
 ## Install
 
@@ -109,7 +111,7 @@ The installer never commits. A Claude Code plugin install of Matt's skills names
 
 ### Then
 
-1. Edit `.agentic/project.json` if needed (required checks, time zone, archive folder).
+1. Edit `.agentic/project.json` if needed (required checks, time zone, archive folder, remote executors).
 2. Commit `.agentic`, the provider skills, `AGENTS.md` and `docs/agents/issue-tracker.md` on the main branch.
    Do this before `/to-spec`: `campaign init` refuses a main branch without the committed kit, because the
    campaign worktree and the engine come from the committed branch. The same goes for later edits of
@@ -125,12 +127,19 @@ The settings (`.agentic/project.json`) and every `AGENTIC_*` environment variabl
 `agentic/README.md`, installed as `.agentic/README.md`. The effective `project.json` is the main branch's
 committed copy.
 
+Remote executors: `executors` in `project.json` lists machines (reached over ssh) that run workers next to the local
+ones. The engine still does everything else here (worktrees, commits, validation, review, integration); each worker
+invocation syncs the ticket worktree there and back, and falls back to this machine when the host is unreachable.
+
+Claude accounts: `AGENTIC_CLAUDE_ACCOUNTS=udarnik` (or any command with the same `account` subcommands) lets the Claude
+adapter run in the hook's current account and retry once in another one after a usage limit.
+
 ## Layout
 
 ```
 agentic/        engine, installed as <project>/.agentic/
   bin/          campaign (the supervisor), campaign-watch
-  lib/          shared shell and Python helpers
+  lib/          shared shell and Python helpers, remote-run.sh (worker invocations on an executor)
   providers/    claude, codex and grok adapters, RESULT parsing
   roles/        worker, reviewer and diagnostician prompts
   tests/        engine tests, run by `campaign self-test`

@@ -105,20 +105,30 @@ cmd_current() {
   if $json; then jq -cn --arg slug "$slug" --arg branch "$branch" '{slug:$slug,branch:$branch}'; else note "$slug"; fi
 }
 
+# A SPEC has every section of the current layout, or every section of the legacy one (campaigns created before the
+# kit: accepted, never produced). Sections of the two are never combined to complete one.
 verify_spec() {
-  local spec=$1 missing=() section questions
+  local spec=$1 section questions none='^None\.?$'
+  local -a missing=() missing_legacy=()
   [[ -f $spec ]] || die "missing campaign SPEC: $spec"
   for section in 'Problem Statement' 'Solution' 'User Stories' 'Implementation Decisions' 'Testing Decisions' 'Out of Scope' 'Open questions'; do
     grep -Eq "^#+[[:space:]]+$section[[:space:]]*$" "$spec" || missing+=("$section")
   done
-  ((${#missing[@]} == 0)) || die "SPEC missing sections: ${missing[*]}"
+  for section in 'Problem' 'Goals' 'Non-goals' 'Decisions' 'Requirements' 'Constraints' 'Acceptance' 'Open questions'; do
+    grep -Eq "^#+[[:space:]]+$section[[:space:]]*$" "$spec" || missing_legacy+=("$section")
+  done
+  if ((${#missing[@]} > 0)); then
+    ((${#missing_legacy[@]} == 0)) || die "SPEC missing sections: ${missing[*]}"
+    # The legacy layout also wrote "Nenhuma" for no open question.
+    none='^(None|Nenhuma)\.?$'
+  fi
   questions=$(awk '
     /^#+[[:space:]]+Open questions[[:space:]]*$/ {inside=1; next}
     inside && /^#/ {exit}
     inside {print}
   ' "$spec")
   questions=$(printf '%s\n' "$questions" | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]+//; s/[[:space:]]+$//')
-  if [[ ! $questions =~ ^None\.?$ ]] && \
+  if [[ ! $questions =~ $none ]] && \
      ! awk 'NF && $0 !~ /^([-*][[:space:]]*)?[Nn]on-blocking:/ {exit 1}' <<<"$questions"; then
     die "SPEC Open questions must be 'None' or explicitly non-blocking"
   fi
@@ -131,17 +141,19 @@ missing_required_checks() {
     . as $plan | $required[] as $check
     | ($plan.tickets | to_entries[] | select(has_check(.value.cheap; $check) | not)
         | "ticket \(.key): the cheap phase lacks the required check \($check | tojson)"),
-      (select(has_check($plan.final; $check) | not) | "the final list lacks the required check \($check | tojson)")
+      (select(has_check($plan.final // $plan.campaign_expensive; $check) | not) | "the final list lacks the required check \($check | tojson)")
   ' "$1"
 }
 
-# The trusted validation plan against the campaign's tickets (a JSON list) and the required_checks of project.json.
+# The trusted validation plan against the campaign's tickets (a JSON list) and the required_checks of project.json. A
+# plan without a final list uses its campaign_expensive list as the final one (legacy layout, accepted, not produced).
 verify_plan() {
   local plan=$1 tickets_json=$2 ticket_ids plan_ids missing
   [[ -f $plan && ! -L $plan ]] || die "missing trusted validation plan: $plan"
   jq -e '
     def commands: type == "array" and all(.[]; type == "array" and length > 0 and all(.[]; type == "string" and length > 0));
-    .version == 1 and (.tickets|type == "object") and (.final|commands) and ((.baseline // [])|commands) and
+    .version == 1 and (.tickets|type == "object") and ((.final // .campaign_expensive)|commands) and ((.baseline // [])|commands) and
+    ((.campaign_expensive // [])|commands) and
     all(.tickets[]; (.cheap|commands) and (.component|commands) and (.expensive|commands))
   ' "$plan" >/dev/null || die 'trusted validation plan is malformed'
   ticket_ids=$(jq -c '[.[].id] | sort' <<<"$tickets_json")
@@ -177,6 +189,15 @@ cmd_ready() {
   if $json; then jq '.' <<<"$tickets"; else jq -r '.[] | "\(.id)\t\(.risk)\t\(.path)"' <<<"$tickets"; fi
 }
 
+# {ticket: executor} for the tickets of a runtime that have an assigned executor (local or a remote name).
+active_executors() {
+  local file
+  for file in "$1"/state/*.executor; do
+    [[ -f $file ]] || continue
+    jq -cn --arg id "$(basename -- "$file" .executor)" --arg executor "$(head -n 1 -- "$file")" '{($id): $executor}'
+  done | jq -sc 'add // {}'
+}
+
 cmd_status() {
   assert_campaign_branch
   local json=false slug tickets runtime active=false pid='' decisions='[]'
@@ -186,7 +207,8 @@ cmd_status() {
   if runner_alive "$(campaign_slug)" && compgen -G "$runtime/state/*.active" >/dev/null; then
     local active_ids
     active_ids=$(for file in "$runtime"/state/*.active; do basename -- "$file" .active; done | jq -Rsc 'split("\n")|map(select(length>0))')
-    tickets=$(jq --argjson ids "$active_ids" 'map(if (.id as $id | $ids | index($id)) != null then .status="in-progress" else . end)' <<<"$tickets")
+    tickets=$(jq --argjson ids "$active_ids" --argjson executors "$(active_executors "$runtime")" \
+      'map(if (.id as $id | $ids | index($id)) != null then .status="in-progress" | .executor=($executors[.id] // "local") else . end)' <<<"$tickets")
   fi
   if runner_alive "$slug"; then
     active=true
@@ -203,7 +225,7 @@ cmd_status() {
   else
     note "Campaign: $slug"
     note "Runner: $(if $active; then printf 'active (pid %s)' "$pid"; else printf 'inactive'; fi)"
-    jq -r '.[] | "\(.id)\t\(.status)\t\(.risk)"' <<<"$tickets"
+    jq -r '.[] | "\(.id)\t\(.status)\t\(.risk)\(if .executor then "\texecutor=\(.executor)" else "" end)"' <<<"$tickets"
     jq -r '.[] | "DECISION\t\(.ticket)\t\(.reason)\toptions=\(.options|join(","))"' <<<"$decisions"
   fi
 }
@@ -280,9 +302,33 @@ write_prompt() {
   chmod 600 "$prompt"
 }
 
+# The executor that runs the worker-role invocations of a ticket in this run: a configured executor, or local.
+ticket_executor() {
+  local name
+  name=$(cat -- "$(ensure_runtime)/state/$1.executor" 2>/dev/null) || name=local
+  if [[ $name != local ]] && ! jq -e --arg name "$name" 'any(.[]; .name == $name)' <<<"$PROJECT_EXECUTORS" >/dev/null; then
+    name=local
+  fi
+  printf '%s\n' "$name"
+}
+
+# The arguments of lib/remote-run.sh for one invocation on a remote executor, after its first argument (the adapter).
+remote_run_arguments() {
+  local executor=$1 ticket=$2 slug runtime file key
+  slug=$(campaign_slug); runtime=$(ensure_runtime)
+  printf '%s\n' --executor "$(jq -c --arg name "$executor" '.[] | select(.name == $name)' <<<"$PROJECT_EXECUTORS")" \
+    --ticket "$ticket" --slug "$slug" --main-branch "$MAIN_BRANCH"
+  # Inputs a worker prompt names outside the ticket worktree and the engine.
+  for file in "$runtime/state/$ticket.conflict.patch" "$REPO_ROOT/campaigns/$slug/codex-effort.json"; do
+    if [[ -f $file ]]; then printf '%s\n' --file "$file"; fi
+  done
+  for key in "${PROJECT_ENV_KEYS[@]}"; do printf '%s\n' --env "$key"; done
+}
+
 invoke_provider() {
   local provider=$1 role=$2 worktree=$3 ticket=$4 suffix=$5 extra=${6:-}
-  local runtime adapter prompt result events log rc timeout_seconds started elapsed
+  local runtime adapter prompt result events log rc timeout_seconds started elapsed executor=local reason
+  local -a invocation
   runtime=$(ensure_runtime); adapter=$(provider_adapter "$provider")
   timeout_seconds=$(provider_timeout_seconds "$role") || return 3
   prompt="$runtime/prompts/$ticket-$suffix.md"
@@ -290,21 +336,39 @@ invoke_provider() {
   events="$runtime/events/$ticket.ndjson"
   log="$runtime/logs/$ticket-$suffix.log"
   write_prompt "$role" "$worktree" "$ticket" "$prompt" "$extra"
+  # Only workers leave this machine; reviewers and diagnosticians always run here.
+  [[ $role != worker ]] || executor=$(ticket_executor "$ticket")
   local attempt=1
   while ((attempt <= 2)); do
   [[ ! -f $result ]] || cp -- "$result" "$result.previous"
   [[ ! -f $log ]] || cp -- "$log" "$log.previous"
   started=$SECONDS
-  event provider-started "role=$role timeout_seconds=$timeout_seconds attempt=$attempt" "$ticket"
+  if [[ $executor == local ]]; then
+    invocation=(bash "$adapter")
+    event provider-started "role=$role timeout_seconds=$timeout_seconds attempt=$attempt" "$ticket"
+  else
+    mapfile -t invocation < <(remote_run_arguments "$executor" "$ticket")
+    invocation=(bash "$AGENTIC_DIR/lib/remote-run.sh" "${invocation[@]}" --adapter "$adapter")
+    event provider-started "role=$role timeout_seconds=$timeout_seconds attempt=$attempt executor=$executor" "$ticket"
+  fi
   set +e
   # Own a separate session and reap descendants even when the adapter exits on
   # TERM before a stubborn child. Never signal the supervisor or foreign groups.
   python3 "$AGENTIC_DIR/lib/provider_deadline.py" "$timeout_seconds" \
-    bash "$adapter" "$role" "$worktree" "$prompt" "$result" "$events" >"$log" 2>&1
+    "${invocation[@]}" "$role" "$worktree" "$prompt" "$result" "$events" >"$log" 2>&1
   rc=$?
   set -e
   elapsed=$((SECONDS - started))
   sanitize_file "$log"; sanitize_file "$events"
+  # The executor failed before its adapter started: the ticket runs here for the rest of the run, and the same
+  # invocation is repeated at once without spending one of its two attempts.
+  if [[ $executor != local ]] && ((rc == 75)); then
+    reason=$(grep -m1 -o 'executor unavailable: .*' "$log" 2>/dev/null | head -c 300) || true
+    event executor-unavailable "executor=$executor ${reason:-executor unavailable}; the ticket runs locally for the rest of this run" "$ticket"
+    executor=local
+    printf 'local\n' >"$runtime/state/$ticket.executor"
+    continue
+  fi
   if ((rc == 124)); then
     event provider-timeout "role=$role elapsed_seconds=$elapsed limit_seconds=$timeout_seconds; delta and evidence preserved; diagnose before explicit recovery; no automatic retry" "$ticket"
     return 3
@@ -758,6 +822,7 @@ run_ticket() {
 
 engine_loop() {
   local provider=$1 workers=$2 slug runtime ready statuses running=0 ticket pid active_json candidate domains occupied collision domain wait_rc
+  local capacity=$2 executor name slots busy executors=''
   assert_campaign_branch; slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
   exec 8>"$runtime/runner.lock"
   # A just-finished follower can release its process before every inherited
@@ -767,11 +832,21 @@ engine_loop() {
   printf '%s\n' "$$" >"$runtime/runner.pid"
   chmod 600 "$runtime/runner.pid"
   trap "rm -f -- '$runtime/runner.pid'" EXIT INT TERM
-  event runner-started "provider=$provider workers=$workers"
+  # Capacity is the local workers plus every executor's. A starting ticket takes the first executor (in settings order)
+  # with a free slot, else a local one, and keeps that slot until it ends, even when it goes on locally because its
+  # executor became unavailable.
+  local -a executor_names=()
+  declare -A executor_slots=()
+  while IFS=$'\t' read -r name slots; do
+    [[ -n $name ]] || continue
+    executor_names+=("$name"); executor_slots[$name]=$slots; capacity=$((capacity + slots)); executors+=" $name:$slots"
+  done < <(jq -r '.[] | "\(.name)\t\(.workers)"' <<<"$PROJECT_EXECUTORS")
+  event runner-started "provider=$provider workers=$workers${executors:+ executors=${executors# } capacity=$capacity}"
   # Interrupted processes leave evidence and worktrees intact; stale markers are not authority.
-  rm -f -- "$runtime"/state/*.active
+  rm -f -- "$runtime"/state/*.active "$runtime"/state/*.executor
   declare -A jobs=()
   declare -A job_domains=()
+  declare -A job_executors=()
   local failed_ids='[]'
   while :; do
     # A coordinator recovery authorizes one new attempt after a known technical repair. The ticket is released
@@ -786,7 +861,7 @@ engine_loop() {
     ready=$(jq --argjson ids "$failed_ids" '[.[] | select((.id as $id | $ids | index($id)) == null)]' <<<"$ready")
     active_json=$(printf '%s\n' "${jobs[@]:-}" | jq -Rsc 'split("\n") | map(select(length>0))')
     ready=$(jq --argjson active "$active_json" '[.[] | select((.id as $id | $active | index($id)) == null)]' <<<"$ready")
-    while ((running < workers)) && (($(jq 'length' <<<"$ready") > 0)); do
+    while ((running < capacity)) && (($(jq 'length' <<<"$ready") > 0)); do
       candidate=''; occupied=$'\n'
       for pid in "${!job_domains[@]}"; do occupied+="${job_domains[$pid]}"$'\n'; done
       while (($(jq 'length' <<<"$ready") > 0)); do
@@ -802,21 +877,33 @@ engine_loop() {
       done
       [[ -n $candidate ]] || break
       ticket=$candidate
+      executor=local
+      for name in "${executor_names[@]}"; do
+        busy=0
+        for pid in "${!job_executors[@]}"; do
+          if [[ ${job_executors[$pid]} == "$name" ]]; then busy=$((busy + 1)); fi
+        done
+        if ((busy < ${executor_slots[$name]})); then executor=$name; break; fi
+      done
+      # Every worker-role invocation of the ticket in this run reads its executor from this file.
+      printf '%s\n' "$executor" >"$runtime/state/$ticket.executor"
+      if ((${#executor_names[@]} > 0)); then event executor-assigned "executor=$executor" "$ticket"; fi
       run_ticket "$provider" "$ticket" &
-      pid=$!; jobs[$pid]=$ticket; job_domains[$pid]=$domains; running=$((running + 1))
+      pid=$!; jobs[$pid]=$ticket; job_domains[$pid]=$domains; job_executors[$pid]=$executor; running=$((running + 1))
     done
     if ((running > 0)); then
       # A free slot rescans the queue every minute, so a ticket released by `decide` or `recover`, or added to the
       # plan, starts without waiting for a running ticket to end.
       rescan_timer=''
-      if ((running < workers)); then sleep "${AGENTIC_RESCAN_SECONDS:-60}" & rescan_timer=$!; fi
+      if ((running < capacity)); then sleep "${AGENTIC_RESCAN_SECONDS:-60}" & rescan_timer=$!; fi
       set +e; wait -n -p pid; wait_rc=$?; set -e
       if [[ -n $rescan_timer ]]; then
         [[ $pid == "$rescan_timer" ]] && continue
         kill "$rescan_timer" 2>/dev/null; wait "$rescan_timer" 2>/dev/null || true
       fi
       ticket=${jobs[$pid]}
-      unset 'jobs[$pid]' 'job_domains[$pid]'; running=$((running - 1))
+      unset 'jobs[$pid]' 'job_domains[$pid]' 'job_executors[$pid]'; running=$((running - 1))
+      rm -f -- "$runtime/state/$ticket.executor"
       if ((wait_rc != 0)); then
         rm -f -- "$runtime/state/$ticket.active"
         failed_ids=$(jq --arg id "$ticket" '. + [$id]' <<<"$failed_ids")
@@ -1467,7 +1554,8 @@ ticket_progress() {
       + (if $ticket.status == "in-progress" and ($starts | length) > 0 then
           $mine[-1] as $last | ($last | role) as $role
           | ($mine[$starts[-1]:] | any(.type == "provider-completed" and role == "reviewer")) as $reviewed
-          | {started_local_time: $mine[$starts[0]].local_time,
+          | {executor: ($ticket.executor // "local"),
+             started_local_time: $mine[$starts[0]].local_time,
              elapsed_seconds: ((now - ($mine[$starts[0]].time | seconds)) | floor),
              phase: (if ($last.type == "ticket-started") or ($last.type == "provider-started" and $role == "worker")
                        then (if $reviewed then "repairing" else "implementing" end)
@@ -1504,7 +1592,10 @@ cmd_overview() {
     [[ -d $tree/campaigns/$slug/tickets ]] && tickets=$(python3 "$TICKET_TOOL" list "$tree/campaigns/$slug/tickets" 2>/dev/null || printf '[]')
     active=false; runner_alive "$slug" && active=true
     active_ids=$(for item in "$runtime"/state/*.active; do [[ ! -f $item ]] || basename -- "$item" .active; done | jq -Rsc 'split("\n") | map(select(length > 0))')
-    if $active; then tickets=$(jq --argjson ids "$active_ids" 'map(if (.id as $id | $ids | index($id)) != null then .status = "in-progress" else . end)' <<<"$tickets"); fi
+    if $active; then
+      tickets=$(jq --argjson ids "$active_ids" --argjson executors "$(active_executors "$runtime")" \
+        'map(if (.id as $id | $ids | index($id)) != null then .status = "in-progress" | .executor = ($executors[.id] // "local") else . end)' <<<"$tickets")
+    fi
     decisions=$( (cat "$runtime"/decisions/*.json 2>/dev/null || true) | jq -sc '.')
     events=$( (tail -n 10 "$runtime/events/campaign.ndjson" 2>/dev/null || true) | with_local_time)
     tickets=$(ticket_progress "$tickets" "$runtime/events/campaign.ndjson")

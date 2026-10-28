@@ -65,14 +65,64 @@ arguments=(
   # User/plugin hooks (e.g. a blocking PermissionRequest hook) would stall a headless worker.
   --settings '{"disableAllHooks":true}'
 )
+# Optional account hook, compatible with udarnik: AGENTIC_CLAUDE_ACCOUNTS names a command. While `<command> account
+# enabled` succeeds, claude runs in the account `<command> account current` names, through the env prefix of `<command>
+# account env ACCOUNT`. A failure goes to `<command> account limit ACCOUNT` on stdin: when it was a usage limit and the
+# hook prints another account, the same invocation runs once more there (exit 75: no account is left). Unset or
+# disabled, claude runs in the caller's account.
+accounts=${AGENTIC_CLAUDE_ACCOUNTS:-}
+account=''
+account_env=()
+account_key() { local name; name=$(basename -- "${1%/}"); printf '%s\n' "${name#.}"; }
+# Sets account_env to the env prefix of an account; fails when the hook does not give one.
+use_account() {
+  local prefix
+  prefix=$("$accounts" account env "$1") || return 1
+  eval "account_env=($prefix)" || return 1
+  [[ ${account_env[0]:-} == env ]] || { account_env=(); return 1; }
+  account=$1
+}
+if [[ -n $accounts ]]; then
+  if ! command -v "$accounts" >/dev/null 2>&1; then
+    printf 'claude adapter: account hook %s not found; running in the current account\n' "$accounts" >&2
+    accounts=''
+  elif ! "$accounts" account enabled >/dev/null 2>&1; then
+    accounts=''
+  elif ! current=$("$accounts" account current) || [[ -z $current ]] || ! use_account "$current"; then
+    printf 'claude adapter: account hook %s gave no usable account; running in the current account\n' "$accounts" >&2
+    accounts=''
+  fi
+fi
+
+run_claude() {
+  set +e
+  (
+    cd -- "$worktree"
+    "${account_env[@]}" claude "${arguments[@]}" < "$combined_prompt" > "$raw_result" 2>"$temporary_dir/stderr"
+  )
+  exit_code=$?
+  set -e
+}
+
 provider_event started 'fresh process started'
-set +e
-(
-  cd -- "$worktree"
-  claude "${arguments[@]}" < "$combined_prompt" > "$raw_result" 2>"$temporary_dir/stderr"
-)
-exit_code=$?
-set -e
+run_claude
+if (( exit_code != 0 )) && [[ -n $accounts ]]; then
+  limit_status=0
+  next=$(command cat -- "$raw_result" "$temporary_dir/stderr" 2>/dev/null | "$accounts" account limit "$account") || limit_status=$?
+  if (( limit_status == 0 )) && [[ -n $next ]] && previous=$account && use_account "$next"; then
+    provider_event account "account $(account_key "$previous") hit its usage limit; retrying once in account $(account_key "$account")"
+    if [[ $role == worker ]]; then
+      printf '\n%s\n' "The previous process for this role was cut off by a provider usage limit. Any uncommitted change in the worktree is its partial, unverified work: compare it with the ticket's Acceptance, finish what is missing and remove anything the ticket does not ask for, then run the ticket's cheap checks." >> "$combined_prompt"
+    fi
+    run_claude
+    # Keep the hook's account state true when the second account is out too; there is no further retry.
+    if (( exit_code != 0 )); then
+      command cat -- "$raw_result" "$temporary_dir/stderr" 2>/dev/null | "$accounts" account limit "$account" >/dev/null 2>&1 || true
+    fi
+  elif (( limit_status == 75 )); then
+    provider_event account "account $(account_key "$account") hit its usage limit and no other account is available"
+  fi
+fi
 if (( exit_code != 0 )); then
   provider_failed "$exit_code" "$temporary_dir/stderr" "$raw_result" || true
   exit "$exit_code"

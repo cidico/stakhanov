@@ -115,6 +115,9 @@ def plan_read(path):
     plan = json.loads(path.read_text())
     if plan.get('version') != 1 or not isinstance(plan.get('tickets'), dict):
         raise ValueError('invalid validation plan version or tickets')
+    # Legacy layout (accepted, not produced): without a final list, the campaign_expensive list is the final one.
+    if plan.get('final') is None and plan.get('campaign_expensive') is not None:
+        plan['final'] = plan['campaign_expensive']
     commands(plan.get('final'))
     if not commands(plan.get('final')):
         raise ValueError('campaign final validation is required')

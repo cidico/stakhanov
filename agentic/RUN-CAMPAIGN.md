@@ -68,7 +68,8 @@ from a Sonnet or Opus session, never Fable: supervision is routine. While a runn
   coordinator must act on (for example a cutover gate), or every required ticket done. Otherwise it
   returns a `ROUTINE` line after `--max-minutes` (default
   115). While only an optional ticket still runs, pass `--ignore-required-done` so the watcher waits for
-  the runner to stop instead of returning at once.
+  the runner to stop instead of returning at once. Once a needs-human checkpoint is already waiting on the
+  owner, pass `--ignore TICKET` (repeatable) so it stops waking the watcher; everything else still wakes it.
 - Never poll for ticket starts, completions or phase changes, and never build a watcher that wakes on
   them.
 - On a `ROUTINE` return, only re-arm. On a `WAKE`, diagnose, fix, and re-arm in the same turn. Do not

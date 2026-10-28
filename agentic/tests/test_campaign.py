@@ -250,6 +250,9 @@ class Repo:
             if [ "$role" = worker ] && [ "$status" = PASS ] && [ -n "${MOCK_APPEND_FILE:-}" ] && echo "$result" | grep -q -- '-worker.json$'; then
               mkdir -p "$(dirname "$worktree/$MOCK_APPEND_FILE")"; printf "$MOCK_APPEND_TEXT" >> "$worktree/$MOCK_APPEND_FILE"
             fi
+            if [ "$role" = worker ] && [ "$status" = PASS ] && [ -n "${MOCK_DELETE_FILE:-}" ] && echo "$result" | grep -q -- '-worker.json$'; then
+              rm -f "$worktree/$MOCK_DELETE_FILE"
+            fi
             if [ "$role" = worker ] && [ -n "${MOCK_SEEN_DIR:-}" ]; then
               mkdir -p "$MOCK_SEEN_DIR"; ls -1 "$worktree" > "$MOCK_SEEN_DIR/$(basename "$result")"
             fi

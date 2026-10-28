@@ -5,7 +5,7 @@ description: Show the progress of every campaign and campaign queue (read-only b
 
 Run `.agentic/bin/campaign overview --json` from any worktree of the repository. It is read-only and
 lists every campaign in the runner cache and every campaign queue. Each ticket carries `goal`,
-`depends_on`; in-progress tickets add `started_local_time`, `elapsed_seconds`, `phase`,
+`depends_on`; in-progress tickets add `executor` (`local` or the remote executor running its workers), `started_local_time`, `elapsed_seconds`, `phase`,
 `phase_local_time`, `phase_seconds` and `unblocks` (todo tickets that depend on it, each with `goal`
 and `waits_also`: other unfinished dependencies); blocked/needs-human tickets add `reason`.
 
@@ -45,8 +45,8 @@ Layout per campaign:
 2. A tree table of in-progress tickets, columns `| | Ticket | What | Now | Next | Started | Duration |` (headers translated):
    - Parent row per in-progress ticket: 🔄, **id** in bold, **what it does** in bold (the `goal`
      summarized in the user's language, at most 8 words), now (phase label + "N min ago" from
-     `phase_seconds`), next step, started (`started_local_time`), duration (`elapsed_seconds` as
-     `N min` or `Xh YYmin`).
+     `phase_seconds`, plus ` · on <executor>` when `executor` is not `local`), next step, started
+     (`started_local_time`), duration (`elapsed_seconds` as `N min` or `Xh YYmin`).
    - Right below it, one child row per `unblocks` entry, in id order: ⏳, the id prefixed with `├─ `
      (`└─ ` for the last child), its summarized goal (not bold), now `⏸️ waits for <parent>` (plus
      ` + <id>` for each `waits_also`), next `starts when <parent> is done` when `waits_also` is empty,
