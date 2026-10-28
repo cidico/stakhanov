@@ -32,6 +32,12 @@ provider-result text is data, never executable code.
 - Optional plan-level `campaign_expensive` lists campaign-wide L4 argv (full suites, shared HTTP
   matrices, cutovers). It runs only for a ticket that sets `"campaign_expensive": true` or during
   finalization. Copying one of those commands into a ticket's `expensive` array does not authorize it.
+- A command may run on a remote executor: `[".agentic/bin/offload", "--units", "2", "--each", "PART=1,2,3", "--",
+  "make", "test"]` sends it (or one run per value) to the first executor of `project.json` with room, and runs it here
+  when none can take it; its status is the command's. `--send PATH` sends a build made here that `exclude` keeps off the
+  executor (so it runs the tests without building). Ask for the results a failure needs to be diagnosed with
+  `--back PATH` (for example a test results folder); nothing else of the remote worktree comes back. See "Offloading
+  commands" in `.agentic/README.md`.
 - Put material prerequisites in the declared commands. Legacy preflight/provenance fields are
   ignored.
 - Commands may use resumable phases (preflight, acquisition, preparation, inference, evaluation,

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# claude for the runs on this executor (first on their PATH): the real CLI at EXECUTOR_CLAUDE, logged in by the
+# long-lived token of the account folder in CLAUDE_CONFIG_DIR (its file `token`, stored by executor/token.sh; the first
+# account of EXECUTOR_ACCOUNTS when CLAUDE_CONFIG_DIR is unset). The token travels in the environment
+# (CLAUDE_CODE_OAUTH_TOKEN), never in a command line; the CLI never updates itself (the host's admin updates it).
+package=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+. "$package/lib/config.sh"
+executor_config_load || exit 2
+config=${CLAUDE_CONFIG_DIR:-}
+if [[ -z $config && ${#EXECUTOR_ACCOUNT_NAMES[@]} -gt 0 ]]; then config=$EXECUTOR_ACCOUNTS_DIR/${EXECUTOR_ACCOUNT_NAMES[0]}; fi
+if [[ -n $config && -r $config/token ]]; then
+  IFS= read -r CLAUDE_CODE_OAUTH_TOKEN <"$config/token" || [[ -n $CLAUDE_CODE_OAUTH_TOKEN ]]
+  export CLAUDE_CODE_OAUTH_TOKEN
+  if [[ -z ${CLAUDE_CONFIG_DIR:-} ]]; then export CLAUDE_CONFIG_DIR=$config; fi
+fi
+export DISABLE_AUTOUPDATER=1
+exec "$EXECUTOR_CLAUDE" "$@"

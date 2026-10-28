@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# agentic-executor-accounts account enabled|current|limit ACCOUNT|next|env ACCOUNT|pick [EXCLUDE...]: the Claude account
+# hook of the runs on this executor (AGENTIC_CLAUDE_ACCOUNTS, which agentic-executor-run points here), with udarnik's
+# `account` commands. An account is a folder <EXECUTOR_ACCOUNTS_DIR>/<name> holding a long-lived token (its file `token`,
+# stored by executor/token.sh), in the order of EXECUTOR_ACCOUNTS; ACCOUNT is that folder, as `current` and `pick` print
+# it. An account that hits its usage limit is out until the reset its error names ("resets 3:30pm (Area/City)", one hour
+# when it names none), in <EXECUTOR_STATE_DIR>/accounts, shared by every run here; the run goes on in the next one.
+#   enabled          exit 0 when at least one account has a token
+#   current          CLAUDE_CONFIG_DIR when it is an available account, else the first available one
+#   limit ACCOUNT    reads claude's output on stdin; when it was a usage limit, marks ACCOUNT out and prints the next
+#                    available account (exit 75 when none is left); exit 1 when it was no usage limit
+#   next             the epoch second at which an account is available (now when one is)
+#   env ACCOUNT      the env prefix that runs claude in ACCOUNT
+#   pick [EXCLUDE...] the first available account not excluded
+set -uo pipefail
+package=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+. "$package/lib/config.sh"
+executor_config_load || exit 2
+state="$EXECUTOR_STATE_DIR/accounts"
+
+accounts() {
+  local account
+  for account in "${EXECUTOR_ACCOUNT_NAMES[@]}"; do
+    if [[ -s $EXECUTOR_ACCOUNTS_DIR/$account/token ]]; then printf '%s\n' "$EXECUTOR_ACCOUNTS_DIR/$account"; fi
+  done
+}
+key() { basename -- "${1%/}"; }
+out_until() {
+  local value
+  value=$(cat -- "$state/$(key "$1").out-until" 2>/dev/null) || value=0
+  [[ $value =~ ^[0-9]+$ ]] || value=0
+  printf '%s\n' "$value"
+}
+available() { (($(out_until "$1") <= $(date +%s))); }
+known() { accounts | grep -qxF -- "${1%/}"; }
+
+pick() { # [EXCLUDE...]
+  local account excluded skip
+  while IFS= read -r account; do
+    skip=''
+    for excluded in "$@"; do [[ $(key "$account") != "$(key "$excluded")" ]] || skip=1; done
+    if [[ -z $skip ]] && available "$account"; then printf '%s\n' "$account"; return 0; fi
+  done < <(accounts)
+  return 1
+}
+
+# reset_epoch TEXT: the epoch second of the reset a usage-limit message names, e.g. "resets 3:30pm (America/Sao_Paulo)"
+# or "resets Oct 30, 9am (Europe/Lisbon)": the next such moment in that zone.
+reset_epoch() {
+  local text=$1 pattern when zone epoch now year
+  pattern='resets[[:space:]]+(.+)[[:space:]]+\(([A-Za-z0-9_/+-]+)\)'
+  [[ $text =~ $pattern ]] || return 1
+  when=${BASH_REMATCH[1]} zone=${BASH_REMATCH[2]}
+  when=${when//,/ }; when=${when// at / }
+  now=$(date +%s)
+  epoch=$(TZ=$zone date -d "$when" +%s 2>/dev/null) || return 1
+  if ((epoch <= now)); then
+    if [[ $when =~ ^[A-Za-z]+[[:space:]]+[0-9]+ ]]; then
+      year=$(TZ=$zone date +%Y)
+      epoch=$(TZ=$zone date -d "$when $((year + 1))" +%s 2>/dev/null) || return 1
+    else
+      epoch=$(TZ=$zone date -d "$when tomorrow" +%s 2>/dev/null) || return 1
+    fi
+  fi
+  printf '%s\n' "$epoch"
+}
+
+[[ ${1:-} == account ]] || { printf 'usage: agentic-executor-accounts account enabled|current|limit|next|env|pick\n' >&2; exit 64; }
+case ${2:-} in
+  enabled) [[ -n $(accounts) ]] ;;
+  current)
+    account=${CLAUDE_CONFIG_DIR:-}
+    if [[ -n $account ]] && known "$account" && available "$account"; then printf '%s\n' "${account%/}"; exit 0; fi
+    pick "$account" || pick || { [[ -z $account ]] || printf '%s\n' "${account%/}"; } ;;
+  limit)
+    account=${3:?usage: agentic-executor-accounts account limit ACCOUNT}
+    text=$(cat)
+    grep -Eqi 'hit your .*limit|usage limit reached' <<<"$text" || exit 1
+    epoch=$(reset_epoch "$text") || epoch=$(($(date +%s) + 3600))
+    mkdir -p -- "$state" && printf '%s\n' "$epoch" >"$state/$(key "$account").out-until"
+    pick "$account" || exit 75 ;;
+  next)
+    best=0 now=$(date +%s)
+    while IFS= read -r account; do
+      out=$(out_until "$account")
+      if ((out <= now)); then printf '%s\n' "$now"; exit 0; fi
+      if ((best == 0 || out < best)); then best=$out; fi
+    done < <(accounts)
+    printf '%s\n' "$best" ;;
+  env) printf 'env CLAUDE_CONFIG_DIR=%q\n' "${3:?usage: agentic-executor-accounts account env ACCOUNT}" ;;
+  pick) shift 2; pick "$@" ;;
+  *) printf 'agentic-executor-accounts: unknown command %s\n' "${2:-}" >&2; exit 64 ;;
+esac

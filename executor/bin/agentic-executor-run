@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# agentic-executor-run COMMAND...: the run prefix of a Stakhanov executor (`run` in the project's executors entry; see
+# executor/README.md). It runs as root in the ssh session the controlling machine opened for one run, and:
+#   - takes AGENTIC_UNITS of the executor's units (default EXECUTOR_WORKER_UNITS; 0 takes none, as the check of the
+#     entry's requires does), waiting while they are busy, and holds them until COMMAND's last process ends;
+#   - stops the run, waiting or running, when that ssh session ends (the runner there died);
+#   - runs COMMAND through executor_host_run (lib/hostrun.sh): as the run user, in the slice, in the network namespace
+#     when one is set, with every EXECUTOR_BIND_PATHS entry P presented at P from <EXECUTOR_ROOT>/P.
+# The run's environment: a clean base (HOME = the first bound path, USER, LANG, PATH = the package's accounts folder,
+# with its claude and account hook, then EXECUTOR_PATH and the standard folders, the proxies, CLAUDE_CONFIG_DIR = the
+# first account, AGENTIC_UNITS), then EXECUTOR_ENV_FILE's NAME=VALUE lines, then what COMMAND's own leading
+# `env NAME=VALUE...` sets (the runner's variables), then AGENTIC_EXECUTOR_RUN=1, AGENTIC_CLAUDE_ACCOUNTS=<the package's
+# hook>, AGENTIC_EXECUTOR_CONF and CLAUDE_CONFIG_DIR, which always win. Exit status: COMMAND's; 143 when stopped; 64 for
+# a unit count the executor cannot give; 2 for unusable settings.
+set -uo pipefail
+package=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+. "$package/lib/config.sh"
+executor_config_load || exit 2
+. "$package/lib/session.sh"
+. "$package/lib/units.sh"
+. "$package/lib/hostrun.sh"
+
+(($# > 0)) || { printf 'usage: agentic-executor-run COMMAND...\n' >&2; exit 64; }
+units=${AGENTIC_UNITS:-$EXECUTOR_WORKER_UNITS}
+if [[ ! $units =~ ^[0-9]+$ ]] || ((units > EXECUTOR_UNITS)); then
+  printf 'agentic-executor-run: AGENTIC_UNITS=%s, but this executor has %s units\n' "$units" "$EXECUTOR_UNITS" >&2
+  exit 64
+fi
+units=$((10#$units))
+
+name="agentic-run-$(date +%s)-$$"
+record="$EXECUTOR_STATE_DIR/runs/$name"
+trap 'rm -f -- "$record"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+# What agentic-executor-status shows: the command without its env words.
+words=("$@")
+if [[ ${words[0]} == env ]]; then
+  words=("${words[@]:1}")
+  while ((${#words[@]} > 0)) && [[ ${words[0]} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do words=("${words[@]:1}"); done
+fi
+what="${words[*]}"
+what=${what//[$'\n\t']/ }
+mkdir -p -- "$EXECUTOR_STATE_DIR/runs"
+printf '%s %s waiting %s %s\n' "$$" "$units" "$(date +%s)" "${what:0:160}" >"$record"
+
+executor_watch_session sh -c 'systemctl stop "$1" >/dev/null 2>&1; kill -TERM "$2" 2>/dev/null' agentic-watch "$name.scope" "$$"
+((units == 0)) || executor_units_wait "$units"
+printf '%s %s running %s %s\n' "$$" "$units" "$(date +%s)" "${what:0:160}" >"$record"
+
+home=${EXECUTOR_BINDS[0]}
+environment=("HOME=$home" "USER=$EXECUTOR_USER" "LOGNAME=$EXECUTOR_USER" SHELL=/bin/bash LANG=C.UTF-8
+  "PATH=$package/accounts${EXECUTOR_PATH:+:$EXECUTOR_PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  DISABLE_AUTOUPDATER=1 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory 'GIT_CONFIG_VALUE_0=*' "AGENTIC_UNITS=$units")
+forced=(AGENTIC_EXECUTOR_RUN=1 "AGENTIC_CLAUDE_ACCOUNTS=$package/accounts/agentic-executor-accounts"
+  "AGENTIC_EXECUTOR_CONF=$EXECUTOR_CONF")
+if ((${#EXECUTOR_ACCOUNT_NAMES[@]} > 0)); then
+  environment+=("CLAUDE_CONFIG_DIR=$EXECUTOR_ACCOUNTS_DIR/${EXECUTOR_ACCOUNT_NAMES[0]}")
+  forced+=("CLAUDE_CONFIG_DIR=$EXECUTOR_ACCOUNTS_DIR/${EXECUTOR_ACCOUNT_NAMES[0]}")
+fi
+if [[ -n $EXECUTOR_PROXY ]]; then
+  environment+=("http_proxy=$EXECUTOR_PROXY" "https_proxy=$EXECUTOR_PROXY" "HTTP_PROXY=$EXECUTOR_PROXY"
+    "HTTPS_PROXY=$EXECUTOR_PROXY" "no_proxy=$EXECUTOR_NO_PROXY" "NO_PROXY=$EXECUTOR_NO_PROXY")
+fi
+if [[ -n $EXECUTOR_ENV_FILE && -f $EXECUTOR_ENV_FILE ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then environment+=("$line"); fi
+  done <"$EXECUTOR_ENV_FILE"
+fi
+
+# The forced variables go right after COMMAND's own env words, so they win over what the runner forwarded.
+command=("$@")
+if [[ ${command[0]} == env ]]; then
+  index=1
+  while ((index < ${#command[@]})) && [[ ${command[index]} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do index=$((index + 1)); done
+  command=("${command[@]:0:index}" "${forced[@]}" "${command[@]:index}")
+else
+  command=(env "${forced[@]}" "${command[@]}")
+fi
+
+rc=0
+executor_host_run "$name" "$home" "${environment[@]}" -- "${command[@]}" || rc=$?
+exit "$rc"

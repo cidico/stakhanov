@@ -42,7 +42,7 @@ the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.m
   installer installs the missing ones (see below); with `--no-machine-setup` you provide them.
 - At least one provider CLI: `claude`, `codex` or `grok`. The installer installs it when it is missing.
 - Optional: a working user systemd, so the engine runs in the user's `background.slice`.
-- Optional: `ssh` and `rsync`, here and on the hosts, to run workers on remote executors (`executors` in
+- Optional: `ssh` and `rsync`, here and on the hosts, to run workers and commands on remote executors (`executors` in
   `.agentic/project.json`).
 
 ## Install
@@ -129,7 +129,10 @@ committed copy.
 
 Remote executors: `executors` in `project.json` lists machines (reached over ssh) that run workers next to the local
 ones. The engine still does everything else here (worktrees, commits, validation, review, integration); each worker
-invocation syncs the ticket worktree there and back, and falls back to this machine when the host is unreachable.
+invocation syncs the ticket worktree there and back, and falls back to this machine when the host is unreachable, lacks
+a required command or has no room. `.agentic/bin/offload -- COMMAND` sends one command (a validation command, a heavy
+test suite) to an executor the same way, and runs it here when none can take it. `executor/` is the package that turns
+a Linux machine into an executor (`executor/install.sh root@host --config executor.conf`; see `executor/README.md`).
 
 Claude accounts: `AGENTIC_CLAUDE_ACCOUNTS=udarnik` (or any command with the same `account` subcommands) lets the Claude
 adapter run in the hook's current account and retry once in another one after a usage limit.
@@ -138,14 +141,15 @@ adapter run in the hook's current account and retry once in another one after a 
 
 ```
 agentic/        engine, installed as <project>/.agentic/
-  bin/          campaign (the supervisor), campaign-watch
-  lib/          shared shell and Python helpers, remote-run.sh (worker invocations on an executor)
+  bin/          campaign (the supervisor), campaign-watch, offload (a command on an executor)
+  lib/          shared shell and Python helpers, remote.sh (one executor's steps), remote-run.sh (worker invocations)
   providers/    claude, codex and grok adapters, RESULT parsing
   roles/        worker, reviewer and diagnostician prompts
   tests/        engine tests, run by `campaign self-test`
   *.md          the documents listed under Flow
 skills/         /run-campaign, /finalize-campaign and /campaign-status per provider
 templates/      the block inserted into AGENTS.md and the tracker configuration
+executor/       the executor package, installed on a host with executor/install.sh (never into a project)
 tests/          installer tests
 install.sh
 ```
@@ -157,6 +161,7 @@ python3 -m unittest discover -s agentic/tests -p 'test_*.py'   # engine (mock pr
 bash agentic/tests/provider-adapters.sh                        # adapter arguments and RESULT parsing
 agentic/bin/campaign self-test                                 # both, as installed in a project
 bash tests/install.sh                                          # the installer (temporary repos and homes, stubbed network, sudo and package managers)
+bash executor/tests/executor.sh                                # the executor package (stubbed systemd, namespaces, ssh and claude; no root)
 ```
 
 The tests never call a real model: providers are mocks and every repository is temporary.

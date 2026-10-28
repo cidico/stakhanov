@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# offload [--units N] [--each NAME=V1,V2,...] [--send PATH]... [--back PATH]... -- COMMAND...
+#
+# Runs COMMAND for the current worktree on the first remote executor of the project (executors in .agentic/project.json,
+# in settings order, read as the runner reads them) that is reachable, has its requires and admits a run of N units
+# (--units, default 1); see "Offloading commands" in .agentic/README.md. The executor gets the worktree as it is here
+# (commit, uncommitted changes and deletions) and the sync_paths, through the same mirror as remote workers
+# (lib/remote.sh), then every --send PATH even when the executor's exclude leaves it out (for example a build made here,
+# so the executor runs the tests without building): a folder is mirrored exactly (deletions included), a file copied.
+# COMMAND runs there from the current folder, with every AGENTIC_* variable (but the transport ones),
+# the project's env keys, the executor's env, AGENTIC_UNITS=N and AGENTIC_OFFLOAD=1, on a connection of its own; its
+# stdout and stderr stream here. Afterwards every --back PATH (relative to the current folder, inside the worktree) and
+# the sync_paths come back, never deleting here; nothing else of the worktree does, so the command must not be meant to
+# change it.
+#
+# --each NAME=V1,V2,... runs COMMAND once per value, with NAME=value in its environment, all at once on the same remote
+# worktree; every output line carries "[<executor> NAME=value] " and a final line per value says PASS or FAIL and where
+# it ran. The status is 0 only when every run exits 0 (else 1).
+#
+# COMMAND runs here (same additions, from the current folder; with --each one value after another) when no executor can
+# take it (unreachable, a required command missing, admit refuses, a failing setup), when AGENTIC_EXECUTORS=local, and
+# always when AGENTIC_OFFLOAD=1 or AGENTIC_EXECUTOR_RUN=1 says this already is an executor run: an offload never nests.
+# Here --send and --back do nothing: the paths already are here. --send and --back take paths relative to the current
+# folder, inside the worktree; a --send path that does not exist is a usage error, found before anything is sent.
+# Exit status: COMMAND's own (1 when copying back failed after it passed); 64 for a usage error; TERM or INT stop the
+# remote process groups (TERM, then KILL after 3 seconds) and exit 143 or 130.
+set -euo pipefail
+
+agentic_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+usage() {
+  printf 'usage: offload [--units N] [--each NAME=V1,V2,...] [--send PATH]... [--back PATH]... -- COMMAND...\n' >&2
+  exit 64
+}
+refuse() {
+  printf 'offload: %s\n' "$*" >&2
+  exit 64
+}
+
+units=1 each_name='' each_values=() send=() back=()
+while (($#)); do
+  case $1 in
+    --units|--each|--send|--back) (($# >= 2)) || usage ;;&
+    --units) units=$2; shift 2 ;;
+    --each)
+      [[ -z $each_name ]] || refuse 'only one --each is accepted'
+      [[ $2 =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.+)$ ]] || refuse "--each needs NAME=V1,V2,...: $2"
+      each_name=${BASH_REMATCH[1]} rest="${BASH_REMATCH[2]},"
+      while [[ -n $rest ]]; do
+        [[ -n ${rest%%,*} ]] || refuse "--each has an empty value: $2"
+        each_values+=("${rest%%,*}"); rest=${rest#*,}
+      done
+      shift 2 ;;
+    --send) send+=("$2"); shift 2 ;;
+    --back) back+=("$2"); shift 2 ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+(($# > 0)) || usage
+[[ $units =~ ^[1-9][0-9]*$ ]] || refuse "--units must be a positive integer: $units"
+
+here=$(pwd -P)
+nested=false
+[[ ${AGENTIC_OFFLOAD:-} != 1 && ${AGENTIC_EXECUTOR_RUN:-} != 1 ]] || nested=true
+executors=()
+if ! $nested; then
+  # The project settings as the runner reads them (the main branch's committed project.json, the env map exported,
+  # AGENTIC_EXECUTORS=local honored); this command keeps the caller's umask and word splitting.
+  saved_umask=$(umask)
+  # shellcheck source=../lib/common.sh
+  source "$agentic_dir/lib/common.sh"
+  umask "$saved_umask"
+  IFS=$' \t\n'
+  mapfile -t executors < <(jq -c '.[]' <<<"$PROJECT_EXECUTORS")
+  worktree=$REPO_ROOT
+  # in_worktree OPTION PATH: PATH (relative to the current folder) as a path relative to the worktree, inside it.
+  in_worktree() {
+    local target
+    [[ $2 != /* ]] || refuse "$1 takes a path relative to the current folder: $2"
+    target=$(realpath -m -- "$here/$2")
+    [[ $target == "$worktree"/* && $target != "$worktree/.git" && $target != "$worktree"/.git/* ]] \
+      || refuse "$1 must name a path inside the worktree (never the worktree itself): $2"
+    printf '%s\n' "${target#"$worktree"/}"
+  }
+  send_paths=() back_paths=()
+  for path in "${send[@]}"; do
+    send_paths+=("$(in_worktree --send "$path")") || exit 64
+    [[ -e $worktree/${send_paths[-1]} ]] || refuse "--send names a path that does not exist: $path"
+  done
+  for path in "${back[@]}"; do back_paths+=("$(in_worktree --back "$path")") || exit 64; done
+fi
+# shellcheck source=../lib/remote.sh
+source "$agentic_dir/lib/remote.sh"
+
+temporary=$(mktemp -d)
+job_pids=() pgid_files=() stop_where=local
+trap 'rm -rf -- "$temporary"' EXIT
+
+on_signal() {
+  trap '' TERM INT
+  local file
+  printf 'offload: interrupted; stopping the run%s\n' "$( [[ $stop_where == local ]] || printf ' on %s' "$destination")" >&2
+  if ((${#job_pids[@]} > 0)); then kill "${job_pids[@]}" 2>/dev/null || true; fi
+  for file in "${pgid_files[@]}"; do
+    if [[ $stop_where == local ]]; then bash -c "$STOP" agentic-stop "$file" & else remote_stop "$file" & fi
+  done
+  wait || true
+  exit "$((128 + $1))"
+}
+trap 'on_signal 15' TERM
+trap 'on_signal 2' INT
+
+prefix_lines() { LABEL=$1 awk '{ print ENVIRON["LABEL"] $0; fflush() }'; }
+# labeled LABEL STATUS-FILE COMMAND...: runs COMMAND with LABEL before every line of its stdout and of its stderr (each
+# stream kept apart), and writes COMMAND's status to STATUS-FILE.
+labeled() {
+  local label=$1 status_file=$2
+  shift 2
+  { "$@" 2>&1 1>&3 3>&- | prefix_lines "$label" >&2 3>&-
+    printf '%s\n' "${PIPESTATUS[0]}" >"$status_file"
+  } 3>&1 | prefix_lines "$label"
+}
+
+# summary WHERE: one line per --each value, PASS or FAIL and where it ran; 0 only when every value passed.
+summary() {
+  local index status failed=0
+  for index in "${!each_values[@]}"; do
+    status=$(cat -- "$temporary/status-$index" 2>/dev/null) || status=''
+    if [[ $status == 0 ]]; then
+      printf 'offload: %s=%s PASS on %s\n' "$each_name" "${each_values[index]}" "$1" >&2
+    else
+      printf 'offload: %s=%s FAIL (exit %s) on %s\n' "$each_name" "${each_values[index]}" "${status:-unknown}" "$1" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+# run_here: COMMAND on this machine, from the current folder, with the same additions as on an executor.
+run_here() {
+  local index
+  if ((${#each_values[@]} == 0)); then
+    rm -rf -- "$temporary"
+    exec env "AGENTIC_UNITS=$units" AGENTIC_OFFLOAD=1 "$@"
+  fi
+  # One value after another, each in its own process group (RUN), so an interruption stops the whole command.
+  for index in "${!each_values[@]}"; do
+    pgid_files=("$temporary/local-$index.pgid")
+    ( set +e; labeled "[local $each_name=${each_values[index]}] " "$temporary/status-$index" \
+        bash -c "$RUN" agentic-local "${pgid_files[0]}" \
+        env "AGENTIC_UNITS=$units" AGENTIC_OFFLOAD=1 "$each_name=${each_values[index]}" "$@" ) &
+    job_pids=("$!")
+    wait "${job_pids[0]}" || true
+  done
+  job_pids=() pgid_files=()
+  summary local && exit 0
+  exit 1
+}
+
+if $nested || ((${#executors[@]} == 0)); then run_here "$@"; fi
+
+# The commit the remote worktree starts from: the current branch (or a ref of this worktree when detached), with the
+# main branch and, in a campaign, the campaign branch next to it, as a worker would see them.
+if branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD); then
+  head_ref="refs/heads/$branch"
+else
+  branch='' head_ref="refs/agentic/offload/$(printf '%s' "$worktree" | sha256sum | cut -c1-12)"
+fi
+names=()
+add_branch() {
+  if [[ $1 != "$branch" ]] && git -C "$worktree" show-ref --verify --quiet "refs/heads/$1"; then names+=("$1"); fi
+}
+if slug=$(campaign_slug_from_branch "$branch"); then add_branch "campaign/$slug"; fi
+add_branch "$MAIN_BRANCH"
+mirror_for "$worktree"
+
+# prepare EXECUTOR-JSON: that executor reached, admitting the run, with the worktree, the sync_paths and the --send paths
+# in place; exits 75 when it cannot take the run.
+prepare() {
+  executor_load "$1"
+  executor_reach "$(remote_path "$(dirname -- "$worktree")")" --
+  executor_admit "$units"
+  executor_checkout "$worktree" "$head_ref" "$branch" "${names[@]}"
+  executor_sync_worktree "$worktree"
+  executor_sync_paths_out
+  local path there
+  for path in "${send_paths[@]}"; do
+    there="$destination:$(remote_path "$worktree")/$path"
+    if [[ -d $worktree/$path ]]; then
+      step "sending $path" rsync_to --delete --mkpath "$worktree/$path/" "$there/"
+    else
+      step "sending $path" rsync_to --mkpath "$worktree/$path" "$there"
+    fi
+  done
+  printf '%s\n' "$base" >"$temporary/base"
+}
+chosen=''
+for entry in "${executors[@]}"; do
+  set +e
+  ( set -e; prepare "$entry" )
+  rc=$?
+  set -e
+  if ((rc == 0)); then chosen=$entry; break; fi
+  ((rc == 75)) || printf 'offload: preparing executor %s failed (exit %s)\n' "$(jq -r '.name' <<<"$entry")" "$rc" >&2
+done
+if [[ -z $chosen ]]; then
+  printf 'offload: no executor can take the run; it runs here\n' >&2
+  run_here "$@"
+fi
+
+executor_load "$chosen"
+base=$(<"$temporary/base")
+stop_where=remote
+printf 'offload: running on %s (%s) in %s:%s\n' "$name" "$destination" "$destination" "$(remote_path "$here")" >&2
+run_environment "$worktree" "${PROJECT_ENV_KEYS[@]}"
+environment+=("AGENTIC_UNITS=$units" AGENTIC_OFFLOAD=1)
+in_folder=(bash -c 'cd "$1" && shift && exec "$@"' offload "$here")
+rc=0
+if ((${#each_values[@]} == 0)); then
+  pgid_files=("$base/.agentic/run/$key-offload-$$.pgid")
+  remote_run "${pgid_files[0]}" "$units" env "${environment[@]}" "${in_folder[@]}" "$@" &
+  job_pids=("$!")
+  wait "${job_pids[0]}" || rc=$?
+else
+  for index in "${!each_values[@]}"; do
+    pgid_files+=("$base/.agentic/run/$key-offload-$$-$index.pgid")
+    ( set +e; labeled "[$name $each_name=${each_values[index]}] " "$temporary/status-$index" \
+        remote_run "${pgid_files[index]}" "$units" env "${environment[@]}" "$each_name=${each_values[index]}" \
+        "${in_folder[@]}" "$@" ) &
+    job_pids+=("$!")
+  done
+  for pid in "${job_pids[@]}"; do wait "$pid" || true; done
+fi
+job_pids=() pgid_files=()
+
+# Copy back what was asked for and the sync_paths, never deleting here.
+copy_rc=0
+for path in "${back_paths[@]}"; do
+  rsync_to -R --ignore-missing-args "$destination:$(remote_path "$worktree")/./$path" "$worktree/" || { copy_rc=$?; break; }
+done
+((copy_rc != 0)) || executor_sync_paths_back || copy_rc=$?
+
+if ((${#each_values[@]} > 0)); then summary "$name" || rc=1; fi
+if ((copy_rc != 0)); then
+  printf 'offload: copying back from %s failed (rsync exit %s); the files stay at %s:%s\n' \
+    "$destination" "$copy_rc" "$destination" "$(remote_path "$worktree")" >&2
+  ((rc != 0)) || rc=1
+fi
+exit "$rc"

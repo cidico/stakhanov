@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# agentic-executor-status: how many of the executor's units are free, whether a run waits for units, every run (waiting
+# or running) with its units, its age and its command, and the Claude accounts (token present, out until when). Check it
+# with `ssh <executor> agentic-executor-status` before sending heavy work by hand.
+set -uo pipefail
+package=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+. "$package/lib/config.sh"
+executor_config_load || exit 2
+. "$package/lib/units.sh"
+
+free=$(executor_units_free) || free='?'
+waiting=no
+if executor_units_waiting; then waiting=yes; fi
+printf 'free=%s/%s waiting=%s\n' "$free" "$EXECUTOR_UNITS" "$waiting"
+now=$(date +%s)
+for record in "$EXECUTOR_STATE_DIR"/runs/agentic-run-*; do
+  [[ -f $record ]] || continue
+  read -r pid units state started what <"$record" || true
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || continue
+  printf '%s %s units=%s for %sm: %s\n' "$state" "${record##*/}" "$units" "$(((now - started) / 60))" "$what"
+done
+for account in "${EXECUTOR_ACCOUNT_NAMES[@]}"; do
+  if [[ ! -s $EXECUTOR_ACCOUNTS_DIR/$account/token ]]; then
+    printf 'account %s: no token\n' "$account"
+    continue
+  fi
+  out=$(cat -- "$EXECUTOR_STATE_DIR/accounts/$account.out-until" 2>/dev/null) || out=0
+  if [[ $out =~ ^[0-9]+$ ]] && ((out > now)); then
+    printf 'account %s: out until %s\n' "$account" "$(date -d "@$out" '+%Y-%m-%d %H:%M %Z')"
+  else
+    printf 'account %s: ready\n' "$account"
+  fi
+done

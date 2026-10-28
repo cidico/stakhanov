@@ -1,0 +1,62 @@
+# Settings of a Stakhanov executor, installed at /etc/agentic/executor.conf by install.sh (see README.md).
+# Shell KEY=VALUE lines, read with `.` by every command of the package (as root and as the run user): no secrets here.
+# A missing key takes the default shown.
+
+# The user and group the runs execute as (install.sh creates them). The ssh login of the controlling machine is root.
+EXECUTOR_USER=agentic
+EXECUTOR_GROUP=agentic
+# Extra groups of the run user, separated by spaces, for example docker when the projects' tests start containers
+# (membership of docker is root on this host in all but name: see "Security" in README.md).
+EXECUTOR_USER_GROUPS=
+
+# The mirror root: every absolute path of the controlling machine lives under it here (its /x/y at <EXECUTOR_ROOT>/x/y).
+# It must equal the `root` of the project's executors entry.
+EXECUTOR_ROOT=/srv/agentic/work
+# The paths of the controlling machine that a run sees at their own place: each P (separated by spaces) is
+# <EXECUTOR_ROOT>/P bound at P in the run's private mount namespace. Name the folders that hold the worktrees, the
+# runtime cache and the engine: usually the home of the user who runs campaigns there (for example /home/alice). The
+# first one is the run's HOME. Required.
+EXECUTOR_BIND_PATHS=
+
+# Units and account state.
+EXECUTOR_STATE_DIR=/srv/agentic/state
+
+# Capacity, in units: whatever share of this host one unit means for your projects (for example one heavy test
+# partition). A run takes AGENTIC_UNITS units (the entry's worker_units for workers, --units for an offload) and waits
+# while they are busy; agentic-executor-admit refuses a run that would have to wait.
+EXECUTOR_UNITS=4
+# The units of a run that does not say (the default of agentic-executor-run and agentic-executor-admit).
+EXECUTOR_WORKER_UNITS=1
+
+# The systemd slice every run is a scope of, with its caps (empty: no cap). CPUQuota counts 100% per thread.
+EXECUTOR_SLICE=agentic-executor.slice
+EXECUTOR_CPU_QUOTA=
+EXECUTOR_MEMORY_MAX=
+
+# Optional network namespace for the runs (empty: the host network). Its one link is a veth on the bridge
+# EXECUTOR_NETNS_BRIDGE with the address EXECUTOR_NETNS_ADDRESS (CIDR); with EXECUTOR_NETNS_GATEWAY it also gets a
+# default route, otherwise it reaches the bridge's network alone (use EXECUTOR_PROXY for the outside).
+# EXECUTOR_NETNS_AFTER names the units that create the bridge (for example docker.service), separated by spaces.
+EXECUTOR_NETNS=
+EXECUTOR_NETNS_BRIDGE=
+EXECUTOR_NETNS_ADDRESS=
+EXECUTOR_NETNS_GATEWAY=
+EXECUTOR_NETNS_AFTER=
+
+# Optional HTTP proxy for the runs (http_proxy, https_proxy and their upper-case forms) and the hosts it skips.
+EXECUTOR_PROXY=
+EXECUTOR_NO_PROXY=localhost,127.0.0.1
+
+# Claude accounts: folders <EXECUTOR_ACCOUNTS_DIR>/<name>, each with the long-lived token token.sh stores, in the order
+# the runs use them (separated by spaces). The first one is a run's CLAUDE_CONFIG_DIR; after a usage limit the run goes
+# on in the next available one.
+EXECUTOR_ACCOUNTS_DIR=/srv/agentic/accounts
+EXECUTOR_ACCOUNTS=
+# The real claude binary, readable and executable by the run user (not a path under root's home).
+EXECUTOR_CLAUDE=/usr/local/lib/agentic-claude/claude
+
+# Optional file of NAME=VALUE lines added to every run's environment (for example TZ, or settings the projects' tests
+# read); the runner's own variables and the project's env win over it.
+EXECUTOR_ENV_FILE=/etc/agentic/executor.env
+# Extra PATH folders for the runs, separated by colons, before the standard ones (for example /usr/local/go/bin).
+EXECUTOR_PATH=

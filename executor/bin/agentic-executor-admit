@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# agentic-executor-admit [N]: the executor's admission (`admit` in the project's executors entry). Exit 0 when N units
+# (default AGENTIC_UNITS, which the runner sets, else EXECUTOR_WORKER_UNITS) are free now and no run waits for units;
+# otherwise it prints the state and exits 1, and the runner keeps that run on its own machine instead of making it wait
+# here. Racy by nature: a run that takes the units in between only waits a little in agentic-executor-run.
+set -uo pipefail
+package=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+. "$package/lib/config.sh"
+executor_config_load || exit 2
+. "$package/lib/units.sh"
+
+need=${1:-${AGENTIC_UNITS:-$EXECUTOR_WORKER_UNITS}}
+[[ $need =~ ^[0-9]+$ ]] || { printf 'usage: agentic-executor-admit [UNITS]\n' >&2; exit 64; }
+need=$((10#$need))
+if ((need > EXECUTOR_UNITS)); then
+  printf 'asks %s units; this executor has %s\n' "$need" "$EXECUTOR_UNITS"
+  exit 1
+fi
+free=$(executor_units_free) || exit 1
+waiting=no
+if executor_units_waiting; then waiting=yes; fi
+if ((free >= need)) && [[ $waiting == no ]]; then exit 0; fi
+printf 'free=%s/%s waiting=%s\n' "$free" "$EXECUTOR_UNITS" "$waiting"
+exit 1

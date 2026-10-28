@@ -34,6 +34,8 @@ PROJECT_REQUIRED_CHECKS='[]'
 PROJECT_ENV_KEYS=()
 # Remote machines that run workers (a JSON list); AGENTIC_EXECUTORS=local empties it.
 PROJECT_EXECUTORS='[]'
+# Variables an env map of the settings may not set: they would redirect the runner itself.
+REFUSED_ENV_NAMES='^(PATH|HOME|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|PS4)$|^(GIT_|LD_|PYTHON)'
 
 # The branch campaigns branch from and are finalized into: the main_branch of the local project.json, else main, else master.
 resolve_main_branch() {
@@ -54,23 +56,27 @@ resolve_main_branch() {
 MAIN_BRANCH=$(resolve_main_branch)
 
 # The executors list of the settings, checked entry by entry so the error names the field. Missing optional fields
-# are filled in (root "", empty lists) and a trailing slash of root or of a sync path is dropped.
+# are filled in (root "", empty lists and env, worker_units 1) and a trailing slash of root or of a sync path is dropped.
 load_executors() {
   local error
-  error=$(jq -r '
+  error=$(jq -r --arg refused "$REFUSED_ENV_NAMES" '
     def strings: type == "array" and all(.[]; type == "string" and length > 0);
+    def positive: type == "number" and . >= 1 and . == floor;
     def fail($i; $message): "executor \($i + 1)\(if (.name | type) == "string" then " (\(.name))" else "" end): \($message)";
-    (.executors // []) as $list
+    def bad_env_name: .env | keys | map(select(test("^[A-Za-z_][A-Za-z0-9_]*$") | not)) | first;
+    def refused_env_name: .env | keys | map(select(test($refused))) | first;
+    ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options", "sync_paths", "admit", "env", "requires",
+     "worker_units"] as $fields
+    | (.executors // []) as $list
     | if ($list | type) != "array" then "executors must be a list"
       else
         ([$list | to_entries[] | .key as $i | .value
           | if type != "object" then "executor \($i + 1): must be an object"
-            elif (keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options", "sync_paths", "admit"]) != [] then
-              fail($i; "unknown field \((keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options", "sync_paths", "admit"])[0])")
+            elif (keys - $fields) != [] then fail($i; "unknown field \((keys - $fields)[0])")
             elif (.name | type) != "string" or (.name | test("^[a-z0-9-]+$") | not) then fail($i; "name must match [a-z0-9-]+")
             elif .name == "local" then fail($i; "the name local is reserved for this machine")
             elif (.ssh | type) != "string" or (.ssh | test("^[^-\\s]\\S*$") | not) then fail($i; "ssh must be an ssh destination or alias")
-            elif (.workers | type) != "number" or .workers < 1 or .workers != (.workers | floor) then fail($i; "workers must be a positive integer")
+            elif (.workers | positive | not) then fail($i; "workers must be a positive integer")
             elif (.root // "" | type) != "string" or (.root // "" | . == "" or startswith("/") | not) then fail($i; "root must be an absolute path or empty")
             elif .run != null and (.run | strings | not) then fail($i; "run must be a list of non-empty strings")
             elif (.run // []) == [] and (.root // "" | sub("/+$"; "")) != "" then
@@ -80,6 +86,14 @@ load_executors() {
             elif .sync_paths != null and ((.sync_paths | strings | not) or any(.sync_paths[]; startswith("/") | not)) then
               fail($i; "sync_paths must be a list of absolute paths")
             elif .admit != null and (.admit | strings | not) then fail($i; "admit must be a list of non-empty strings")
+            elif .env != null and ((.env | type) != "object" or any(.env[]; type != "string")) then
+              fail($i; "env must be a map of strings")
+            elif .env != null and bad_env_name != null then fail($i; "invalid environment variable name in env: \(bad_env_name)")
+            elif .env != null and refused_env_name != null then
+              fail($i; "env variable \(refused_env_name) would redirect the runner itself and is not allowed")
+            elif .requires != null and ((.requires | strings | not) or any(.requires[]; test("^[A-Za-z0-9_.+/-]+$") | not)) then
+              fail($i; "requires must be a list of command names")
+            elif .worker_units != null and (.worker_units | positive | not) then fail($i; "worker_units must be a positive integer")
             else empty end]
          + [$list | map(objects | .name) | group_by(.)[] | select(length > 1) | "executor name \(.[0]) is not unique"])
         | first // empty
@@ -87,7 +101,8 @@ load_executors() {
   [[ -z $error ]] || die "invalid executors in $PROJECT_CONFIG_SOURCE: $error"
   PROJECT_EXECUTORS=$(jq -c '[(.executors // [])[]
     | .root = (.root // "" | sub("/+$"; "")) | .run = (.run // []) | .exclude = (.exclude // []) | .rsync_options = (.rsync_options // [])
-    | .sync_paths = (.sync_paths // [] | map(sub("/+$"; ""))) | .admit = (.admit // [])]' <<<"$1")
+    | .sync_paths = (.sync_paths // [] | map(sub("/+$"; ""))) | .admit = (.admit // []) | .env = (.env // {})
+    | .requires = (.requires // []) | .worker_units = (.worker_units // 1)]' <<<"$1")
 }
 
 load_project_config() {
@@ -122,10 +137,8 @@ load_project_config() {
   mapfile -t PROJECT_ENV_KEYS < <(jq -r '(.env // {}) | keys[]' <<<"$config")
   for key in "${PROJECT_ENV_KEYS[@]}"; do
     [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid environment variable name in $PROJECT_CONFIG_SOURCE: $key"
-    case $key in
-      PATH|HOME|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|PS4|GIT_*|LD_*|PYTHON*)
-        die "environment variable $key in $PROJECT_CONFIG_SOURCE would redirect the runner itself and is not allowed" ;;
-    esac
+    [[ ! $key =~ $REFUSED_ENV_NAMES ]] \
+      || die "environment variable $key in $PROJECT_CONFIG_SOURCE would redirect the runner itself and is not allowed"
     [[ -z ${!key+x} ]] || continue
     value=$(jq -r --arg key "$key" '.env[$key]' <<<"$config")
     export "$key=$value"

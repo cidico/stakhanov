@@ -69,6 +69,24 @@ exec "${mapped[@]}"
 """
 
 
+# A run prefix that also records the AGENTIC_UNITS it received, as an executor that takes that many units would.
+UNITS_RUN = """\
+#!/usr/bin/env bash
+root=$1
+shift
+printf 'units=%s\\n' "${AGENTIC_UNITS:-}" >> "$root/units.log"
+mapped=()
+for argument in "$@"; do
+  case $argument in
+    /*) mapped+=("$root$argument") ;;
+    *) mapped+=("$argument") ;;
+  esac
+done
+printf '%s\\n' "${mapped[*]}" >> "$root/run.log"
+exec "${mapped[@]}"
+"""
+
+
 class RemoteExecutorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="agentic-remote-")
@@ -93,10 +111,10 @@ class RemoteExecutorTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def repo(self, workers=1, **fields):
+    def repo(self, workers=1, project=None, **fields):
         executor = {"name": "box", "ssh": "box", "workers": workers, "root": str(self.root),
                     "run": [str(self.run_prefix), str(self.root)], "exclude": ["node_modules/"], **fields}
-        repo = Repo(settings={"executors": [executor]})
+        repo = Repo(settings={**(project or {}), "executors": [executor]})
         self.repos.append(repo)
         (repo.root / ".gitignore").write_text("node_modules/\n")
         (repo.root / "doomed.txt").write_text("the worker deletes this\n")
@@ -223,6 +241,41 @@ class RemoteExecutorTests(unittest.TestCase):
         self.assertNotIn("executor-unavailable", [e["type"] for e in self.events(repo)])
         self.assertIn("run.sh worker", self.run_log())
 
+    def test_worker_units_reach_the_admit_command_and_the_run_prefix(self):
+        admit = self.tool(Path(self.temp.name) / "bin" / "admit",
+                          f"#!/usr/bin/env bash\nprintf '%s\\n' \"$AGENTIC_UNITS\" >> {self.root}/admit.log\n")
+        run = self.tool(Path(self.temp.name) / "bin" / "units-run", UNITS_RUN)
+        repo = self.repo(admit=[str(admit)], run=[str(run), str(self.root)], worker_units=3, requires=["git"])
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        self.run_campaign(repo)
+        self.assertEqual(self.states(repo), {"TST-001": "done"})
+        self.assertEqual((self.root / "admit.log").read_text(), "3\n")
+        # The required commands are checked through the run prefix with no units, then the worker takes its three.
+        self.assertEqual((self.root / "units.log").read_text(), "units=0\nunits=3\n")
+        self.assertIn("run.sh worker", self.run_log())
+
+    def test_the_executor_env_reaches_the_worker_after_the_project_env(self):
+        repo = self.repo(project={"env": {"AGENTIC_TEST_SHARED": "project", "AGENTIC_TEST_PROJECT": "yes"}},
+                         env={"AGENTIC_TEST_SHARED": "executor", "EXECUTOR_ONLY": "yes"})
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        self.run_campaign(repo)
+        self.assertEqual(self.states(repo), {"TST-001": "done"})
+        words = self.run_log().splitlines()[0].split()
+        self.assertIn("EXECUTOR_ONLY=yes", words)
+        self.assertIn("AGENTIC_TEST_PROJECT=yes", words)
+        # The later word wins for env: the executor's value comes after the project's.
+        self.assertLess(words.index("AGENTIC_TEST_SHARED=project"), words.index("AGENTIC_TEST_SHARED=executor"))
+
+    def test_an_executor_without_a_required_command_sends_the_ticket_back_here(self):
+        repo = self.repo(requires=["git", "agentic-missing-command"])
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        self.run_campaign(repo)
+        self.assertEqual(self.states(repo), {"TST-001": "done"})
+        unavailable = [e["message"] for e in self.events(repo) if e["type"] == "executor-unavailable"]
+        self.assertEqual(len(unavailable), 1)
+        self.assertIn("box: requires agentic-missing-command", unavailable[0])
+        self.assertNotIn("run.sh worker", self.run_log())
+
     def test_an_unreachable_executor_falls_back_locally_without_spending_an_attempt(self):
         repo = self.repo()
         repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
@@ -343,6 +396,12 @@ class ExecutorSettingsTests(unittest.TestCase):
             "rsync_options must be a list": {"executors": [dict(good, rsync_options="--chmod=g+w")]},
             "sync_paths must be a list of absolute paths": {"executors": [dict(good, sync_paths=["recordings"])]},
             "admit must be a list": {"executors": [dict(good, admit="check")]},
+            "env must be a map of strings": {"executors": [dict(good, env={"COUNT": 2})]},
+            "invalid environment variable name in env: 2X": {"executors": [dict(good, env={"2X": "y"})]},
+            "env variable PATH would redirect": {"executors": [dict(good, env={"PATH": "/opt/bin"})]},
+            "env variable GIT_DIR would redirect": {"executors": [dict(good, env={"GIT_DIR": "/x"})]},
+            "requires must be a list of command names": {"executors": [dict(good, requires=["docker compose"])]},
+            "worker_units must be a positive integer": {"executors": [dict(good, worker_units=0)]},
             "unknown field": {"executors": [dict(good, worker=2)]},
             "is not unique": {"executors": [good, dict(good, workers=2)]},
         }
@@ -356,6 +415,15 @@ class ExecutorSettingsTests(unittest.TestCase):
     def test_a_valid_executor_list_is_accepted(self):
         executor = {"name": "edenred-arch", "ssh": "edenred-arch", "workers": 2, "root": "/srv/work/",
                     "run": ["/usr/local/bin/agentic-worker-run"], "exclude": ["node_modules/"], "rsync_options": ["--chmod=g+w"]}
+        result = self.current({"executors": [executor]})
+        self.assertNotIn("invalid", result.stderr)
+        self.assertIn("outside campaign", result.stderr)
+
+    def test_executor_env_requires_and_worker_units_are_accepted(self):
+        executor = {"name": "build-box", "ssh": "root@build-box", "workers": 2, "root": "/srv/work",
+                    "run": ["/usr/local/bin/agentic-executor-run"], "admit": ["/usr/local/bin/agentic-executor-admit"],
+                    "env": {"AGENTIC_CLAUDE_EFFORT": "medium", "TESTS_PARALLEL": "4"}, "requires": ["dotnet", "docker"],
+                    "worker_units": 2}
         result = self.current({"executors": [executor]})
         self.assertNotIn("invalid", result.stderr)
         self.assertIn("outside campaign", result.stderr)

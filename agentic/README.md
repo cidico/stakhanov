@@ -25,7 +25,7 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `required_checks` | Argv arrays that every ticket's `cheap` phase and the plan's `final` list must contain; `campaign verify` refuses a plan without them, and finalize checks again before the final validation. |
 | `timezone` | Display zone for local times. Precedence: `AGENTIC_DISPLAY_TZ`, then this field, then the system zone. |
 | `archive_dir` | Where finalize archives the campaign history, relative to the main worktree, with `{date}` and `{slug}` placeholders; used only when Git ignores it. Default: the `archive/` folder of the cache. |
-| `executors` | Remote machines that run workers; see [Remote executors](#remote-executors). Default: none, every role runs on this machine. |
+| `executors` | Remote machines that run workers and offloaded commands; see [Remote executors](#remote-executors). Default: none, every role runs on this machine. |
 
 ### Environment variables
 
@@ -50,8 +50,10 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `AGENTIC_CLAUDE_ACCOUNTS` | Account hook command of the Claude adapter (for example `udarnik`); see `providers/claude/README.md`. Unset: claude runs in the caller's account. |
 | `AGENTIC_EXECUTORS` | `local` runs every worker on this machine whatever `executors` declares. Any other non-empty value is an error. |
 | `AGENTIC_SSH` | The ssh command for the executors (default `ssh`), also rsync's `-e` and git's transport. It is split on spaces, so it may carry options. |
+| `AGENTIC_OFFLOAD`, `AGENTIC_EXECUTOR_RUN` | Set to `1`, `bin/offload` runs its command on this machine: it already is an offloaded command (`AGENTIC_OFFLOAD`, which `offload` sets) or an executor run (`AGENTIC_EXECUTOR_RUN`, which the executor package's run prefix sets). |
 
-The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters; it is not a setting.
+The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters, and `AGENTIC_UNITS` for an executor's `admit` and `run` (see
+[Remote executors](#remote-executors)); they are not settings.
 
 ## Starting a campaign
 
@@ -157,11 +159,15 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
 
 ```json
 "executors": [
-  {"name": "build-box", "ssh": "build-box", "workers": 1, "root": "/srv/agentic",
-   "run": ["/usr/local/bin/agentic-worker-run"], "exclude": ["node_modules/", "bin/", "obj/"],
-   "rsync_options": ["--chmod=g+rwX"]}
+  {"name": "build-box", "ssh": "root@build-box", "workers": 1, "root": "/srv/agentic/work",
+   "run": ["/usr/local/bin/agentic-executor-run"], "admit": ["/usr/local/bin/agentic-executor-admit"],
+   "worker_units": 2, "requires": ["dotnet", "docker"], "env": {"TESTS_PARALLEL": "4"},
+   "exclude": ["node_modules/", "bin/", "obj/"], "rsync_options": ["--chmod=g+rwX"]}
 ]
 ```
+
+The kit's `executor/` package (installed on the host, never into a project) provides that `run`, that `admit` and the rest
+of a host: see its `README.md`.
 
 | Field | Meaning |
 | --- | --- |
@@ -169,9 +175,12 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
 | `ssh` | ssh destination or alias. Batch mode: the host must accept a key without prompts. |
 | `workers` | Positive integer: tickets this executor runs at once. |
 | `root` | Absolute path on the host under which every local absolute path is mirrored (local `/x/y` lives at `<root>/x/y` there). Empty (the default) means the same paths. |
-| `run` | Optional argv prefix on the host that runs the adapter and presents `<root>/x/y` at `/x/y` to it (for example a container with bind mounts). It receives `env NAME=VALUE... bash <adapter> <role> <worktree> <prompt> <result> <events>` with local paths. Without it, `root` must be empty. |
+| `run` | Optional argv prefix on the host that runs the adapter and presents `<root>/x/y` at `/x/y` to it (for example a container with bind mounts). It receives `env NAME=VALUE... bash <adapter> <role> <worktree> <prompt> <result> <events>` with local paths (an offloaded command: `env NAME=VALUE... bash -c <cd and exec> offload <folder> <command>...`), and `AGENTIC_UNITS=<n>` in its own environment: the units the run takes. Without it, `root` must be empty. |
 | `exclude` | rsync exclude patterns for the worktree sync, both ways (`/.git` is always excluded). Excluded folders are neither sent nor deleted on either side. |
-| `admit` | Optional argv run on the host before each remote invocation. A non-zero exit means the host has no room now: the ticket runs here for the rest of its run (`executor-unavailable`, no attempt spent) instead of waiting there. Useful when several runners share one host. |
+| `admit` | Optional argv run on the host before each remote invocation, as `env AGENTIC_UNITS=<n> <admit>...`. A non-zero exit means the host has no room now for `n` units: the ticket runs here for the rest of its run (`executor-unavailable`, no attempt spent) instead of waiting there. Useful when several runners share one host. |
+| `worker_units` | Positive integer, default 1: the units (`AGENTIC_UNITS`) a worker invocation asks of `admit` and `run`. What a unit is belongs to the host (the executor package counts them against its capacity). |
+| `requires` | Optional list of command names checked on the host before each remote invocation, through `run` (with `AGENTIC_UNITS=0`, so it takes no units): `[run...] sh -c 'command -v NAME'`. A missing one makes the executor unavailable (`requires NAME`) for that run, as an unreachable one. |
+| `env` | Optional string map exported only into the runs on this executor, after the `AGENTIC_*` variables and the project's `env` keys, so it wins over them. The same names as in the project's `env` are refused. |
 | `sync_paths` | Absolute local folders outside the worktree that the worker reads and may add to (for example recordings kept out of Git). Each one is sent to `<root><path>` before the run and brought back after it, never deleting on either side; a file newer here is kept. |
 | `rsync_options` | Extra rsync options for every transfer. When `run` executes the adapter as another user than the ssh one, give the group access both ways (`--chmod=g+rwX`, with the executor root group-owned or under a default ACL): the engine and its results are owner-only here, and rsync carries the modes. That user must also leave the files it writes readable by the group: the result is written owner-only. |
 
@@ -188,10 +197,11 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
   it; rsync the working files (`--delete`, uncommitted changes and deletions included), the engine, the prompt and the
   ticket's events; run the adapter in its own process group; copy the result, the events and the working files back.
   The adapter receives every `AGENTIC_*` variable (except `AGENTIC_SSH` and `AGENTIC_EXECUTORS`), the `env` keys of
-  `project.json` and the runner's git settings, with its worktree marked `safe.directory`.
-- When the executor fails before the adapter starts (ssh, mirror push, checkout or sync), the engine emits
-  `executor-unavailable` with the reason, runs that ticket here for the rest of the run, and repeats the invocation
-  at once without spending one of its two attempts. The ticket keeps its executor slot, so this machine may run up
+  `project.json`, the executor's `env` and the runner's git settings, with its worktree marked `safe.directory`. Before
+  the push, the host's `requires` are checked and its `admit` asked for `worker_units`.
+- When the executor fails before the adapter starts (ssh, a missing required command, `admit`, mirror push, checkout or
+  sync), the engine emits `executor-unavailable` with the reason, runs that ticket here for the rest of the run, and
+  repeats the invocation at once without spending one of its two attempts. The ticket keeps its executor slot, so this machine may run up
   to the whole capacity while an executor is down. A later ticket tries the executor again. Once the adapter started,
   every status is the adapter's (an adapter exit 75 is reported as 1), and a failed copy back is a failure (1).
 - On a deadline the runner stops the remote process group (TERM, then KILL after 3 seconds) and copies the working
@@ -203,8 +213,51 @@ validation, reviewers, diagnosticians and integration. Declare them in `project.
   of its own (`ControlMaster=no`): when the runner here dies, that session ends on the executor, and a `run` prefix can
   watch for it to stop what it started.
 - `AGENTIC_EXECUTORS=local` runs everything here. The mirror and the remote worktrees are never pruned.
+- `lib/remote.sh` holds these steps; `lib/remote-run.sh` (worker invocations) and `bin/offload` (commands) use it.
 - `campaign-watch` measures the CPU of local processes only: a remote worker that writes no event for longer than
   `--stall-minutes` wakes the coordinator as a silent provider.
+
+## Offloading commands
+
+`.agentic/bin/offload` sends one command (a heavy test suite, a build) from any worktree of the project to an executor,
+and is the way a validation command, a worker or a person uses the executors' capacity:
+
+```
+.agentic/bin/offload [--units N] [--each NAME=V1,V2,...] [--send PATH]... [--back PATH]... -- COMMAND...
+```
+
+- It reads the settings as the runner does (the main branch's committed `project.json`, its `env` exported,
+  `AGENTIC_EXECUTORS=local` honored) and takes the first executor, in settings order, that is reachable, has its
+  `requires` and whose `admit` accepts `AGENTIC_UNITS=N` (`--units`, default 1). The executors' `workers` slots are not
+  involved.
+- The executor gets the worktree as it is here, through the same mirror and steps as a remote worker: its commit (the
+  current branch, with the main branch and, in a campaign, the campaign branch next to it) checked out in
+  `<root><worktree>`, the working files synced over it (uncommitted changes and deletions included, `exclude` kept on
+  both sides) and the `sync_paths`; never the prompt, the result or the events.
+- Then each `--send PATH` (relative to the current folder, inside the worktree) goes there even when `exclude` leaves it
+  out, for example a build made here (`--send backend/tests/App.Tests/bin/Debug`) so the executor runs the tests without
+  building: a folder is mirrored exactly (`--delete`, `--mkpath`), a file copied. A `--send` path that does not exist is
+  a usage error, found before anything is sent.
+- COMMAND runs there from the current folder, on an ssh connection of its own, as
+  `[run...] env <AGENTIC_* but the transport ones> <project env keys> <executor env> AGENTIC_UNITS=N AGENTIC_OFFLOAD=1 bash -c 'cd "$1" && shift && exec "$@"' offload <folder> COMMAND...`
+  (the run prefix also receives `AGENTIC_UNITS=N` in its own environment). Its stdout and stderr stream here, apart.
+- Afterwards each `--back PATH` (relative to the current folder, inside the worktree) comes back with rsync, without
+  deleting anything here, and so do the `sync_paths`. Nothing else of the remote worktree comes back: a validation
+  command must not mean to change the worktree. The exit status is COMMAND's, or 1 when it passed and the copy back
+  failed.
+- `--each NAME=V1,V2,...` runs COMMAND once per value with `NAME=value` in its environment, all at once on the same
+  remote worktree (each run takes N units through the run prefix, which may make some wait there). Every output line
+  carries `[<executor> NAME=value] `, a final line per value says `PASS` or `FAIL (exit S)` and where it ran, and the
+  status is 0 only when every run exited 0 (else 1).
+- COMMAND runs here (from the current folder, with `AGENTIC_UNITS=N AGENTIC_OFFLOAD=1`; with `--each` one value after
+  another; `--send` and `--back` do nothing, the paths already are here) when no executor can take it (unreachable, a
+  required command missing, `admit` refuses, a setup step failing; each reason is printed), when there is no executor
+  or `AGENTIC_EXECUTORS=local`, and always when `AGENTIC_OFFLOAD=1` or `AGENTIC_EXECUTOR_RUN=1` is set: inside an
+  offloaded command or an executor run it never offloads again.
+- TERM or INT stops the remote process groups (TERM, then KILL after 3 seconds; the local ones the same way) and exits
+  143 or 130. A usage error exits 64.
+- The remote worktree is the one a remote worker of the same ticket uses, so the folders `exclude` keeps there (build
+  output, dependencies) stay warm between runs. Run one offload per worktree at a time.
 
 ## Legacy campaign layout (accepted, not produced)
 

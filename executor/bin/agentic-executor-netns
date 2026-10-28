@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# agentic-executor-netns up|down|status: the network namespace EXECUTOR_NETNS where runs execute when it is set. Its
+# only link is a veth whose host end joins the bridge EXECUTOR_NETNS_BRIDGE, with EXECUTOR_NETNS_ADDRESS inside; it has
+# a default route only when EXECUTOR_NETNS_GATEWAY is set, so without one a run reaches the bridge's network alone (and
+# the outside only through EXECUTOR_PROXY). agentic-executor-netns.service runs it at boot. Needs root.
+set -euo pipefail
+package=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+. "$package/lib/config.sh"
+executor_config_load || exit 2
+ns=$EXECUTOR_NETNS
+if [[ -z $ns ]]; then
+  printf 'agentic-executor-netns: EXECUTOR_NETNS is empty; runs use the host network\n' >&2
+  exit 0
+fi
+host_end="${ns:0:11}-h" ns_end="${ns:0:11}-n"
+case ${1:-} in
+  up)
+    ip netns list | grep -qw -- "$ns" || ip netns add "$ns"
+    if ! ip link show "$host_end" >/dev/null 2>&1; then
+      ip link add "$host_end" type veth peer name "$ns_end"
+      ip link set "$ns_end" netns "$ns"
+    fi
+    ip link set "$host_end" master "$EXECUTOR_NETNS_BRIDGE"
+    ip link set "$host_end" up
+    ip -n "$ns" addr show dev "$ns_end" | grep -qF "inet $EXECUTOR_NETNS_ADDRESS " \
+      || ip -n "$ns" addr add "$EXECUTOR_NETNS_ADDRESS" dev "$ns_end"
+    ip -n "$ns" link set "$ns_end" up
+    ip -n "$ns" link set lo up
+    [[ -z $EXECUTOR_NETNS_GATEWAY ]] || ip -n "$ns" route replace default via "$EXECUTOR_NETNS_GATEWAY" ;;
+  down)
+    ip link del "$host_end" 2>/dev/null || true
+    ip netns del "$ns" 2>/dev/null || true ;;
+  status)
+    ip -n "$ns" -br addr
+    ip -n "$ns" route ;;
+  *) printf 'usage: agentic-executor-netns up|down|status\n' >&2; exit 64 ;;
+esac
