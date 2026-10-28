@@ -54,7 +54,7 @@ resolve_main_branch() {
 MAIN_BRANCH=$(resolve_main_branch)
 
 # The executors list of the settings, checked entry by entry so the error names the field. Missing optional fields
-# are filled in (root "", empty lists) and a trailing slash of root is dropped.
+# are filled in (root "", empty lists) and a trailing slash of root or of a sync path is dropped.
 load_executors() {
   local error
   error=$(jq -r '
@@ -65,8 +65,8 @@ load_executors() {
       else
         ([$list | to_entries[] | .key as $i | .value
           | if type != "object" then "executor \($i + 1): must be an object"
-            elif (keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options"]) != [] then
-              fail($i; "unknown field \((keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options"])[0])")
+            elif (keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options", "sync_paths"]) != [] then
+              fail($i; "unknown field \((keys - ["name", "ssh", "workers", "root", "run", "exclude", "rsync_options", "sync_paths"])[0])")
             elif (.name | type) != "string" or (.name | test("^[a-z0-9-]+$") | not) then fail($i; "name must match [a-z0-9-]+")
             elif .name == "local" then fail($i; "the name local is reserved for this machine")
             elif (.ssh | type) != "string" or (.ssh | test("^[^-\\s]\\S*$") | not) then fail($i; "ssh must be an ssh destination or alias")
@@ -77,13 +77,16 @@ load_executors() {
               fail($i; "root needs a run prefix that presents <root>/x at /x; without run the remote paths are the local ones")
             elif .exclude != null and (.exclude | strings | not) then fail($i; "exclude must be a list of non-empty strings")
             elif .rsync_options != null and (.rsync_options | strings | not) then fail($i; "rsync_options must be a list of non-empty strings")
+            elif .sync_paths != null and ((.sync_paths | strings | not) or any(.sync_paths[]; startswith("/") | not)) then
+              fail($i; "sync_paths must be a list of absolute paths")
             else empty end]
          + [$list | map(objects | .name) | group_by(.)[] | select(length > 1) | "executor name \(.[0]) is not unique"])
         | first // empty
       end' <<<"$1") || die "invalid executors in $PROJECT_CONFIG_SOURCE"
   [[ -z $error ]] || die "invalid executors in $PROJECT_CONFIG_SOURCE: $error"
   PROJECT_EXECUTORS=$(jq -c '[(.executors // [])[]
-    | .root = (.root // "" | sub("/+$"; "")) | .run = (.run // []) | .exclude = (.exclude // []) | .rsync_options = (.rsync_options // [])]' <<<"$1")
+    | .root = (.root // "" | sub("/+$"; "")) | .run = (.run // []) | .exclude = (.exclude // []) | .rsync_options = (.rsync_options // [])
+    | .sync_paths = (.sync_paths // [] | map(sub("/+$"; "")))]' <<<"$1")
 }
 
 load_project_config() {

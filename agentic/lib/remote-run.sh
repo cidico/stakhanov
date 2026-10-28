@@ -8,8 +8,8 @@
 # the executor host, and the executor's run prefix presents it at /x to the adapter; without run, root is empty and
 # the paths are the same. The steps: reach the host; push the ticket's commit, the campaign branch and the main branch
 # to a bare mirror there; check that commit out in the remote worktree; sync the working files (uncommitted delta and
-# deletions included), the engine, the prompt, the events and every --file; run the adapter in its own process group;
-# copy the result, the events and the working files back. --env names a variable forwarded to the adapter besides
+# deletions included), the engine, the prompt, the events, every --file and the executor's sync_paths; run the adapter
+# in its own process group; copy the result, the events, the working files and the sync_paths back. --env names a variable forwarded to the adapter besides
 # every AGENTIC_* one.
 #
 # Exit status: 75 when the executor is unavailable before the adapter started (nothing local changed); otherwise the
@@ -52,6 +52,7 @@ root=$(jq -r '.root // "" | sub("/+$"; "")' <<<"$executor_json")
 mapfile -t run_prefix < <(jq -r '(.run // [])[]' <<<"$executor_json")
 mapfile -t exclude_arguments < <(jq -r '(.exclude // [])[] | "--exclude=\(.)"' <<<"$executor_json")
 mapfile -t rsync_options < <(jq -r '(.rsync_options // [])[]' <<<"$executor_json")
+mapfile -t sync_paths < <(jq -r '(.sync_paths // [])[]' <<<"$executor_json")
 
 # AGENTIC_SSH replaces the ssh command, here and as rsync's and git's transport.
 read -r -a ssh_command <<<"${AGENTIC_SSH:-ssh}"
@@ -234,6 +235,13 @@ step 'syncing the engine' rsync_to --delete "$agentic_dir/" "$destination:$(remo
 [[ -z $provider_root ]] || step 'syncing the provider adapter' rsync_to --delete "$provider_root/" \
   "$destination:$(remote_path "$provider_root")/"
 step 'syncing the prompt and events' rsync_to -R --no-implied-dirs "${inputs[@]}" "$destination:${root:-/}"
+# Project folders outside the worktree the worker reads and may add to (sync_paths): sent before, brought back after,
+# never deleting on either side; a file newer on this side is kept.
+for path in "${sync_paths[@]}"; do
+  if [[ -d $path ]]; then
+    step "syncing $path" rsync_to --mkpath "$path/" "$destination:$(remote_path "$path")/"
+  fi
+done
 
 # 5. Run the adapter with the local paths; the run prefix maps them. The adapter gets every AGENTIC_* variable (but
 # the transport ones), the --env ones and the runner's git settings, with its worktree marked safe for git (a container
@@ -278,6 +286,9 @@ rsync_to --ignore-missing-args "$destination:$(remote_path "$result")" "$result"
 ((copy_rc != 0)) || rsync_to --ignore-missing-args "$destination:$(remote_path "$events")" "$events" || copy_rc=$?
 ((copy_rc != 0)) || rsync_to --delete --exclude=/.git "${exclude_arguments[@]}" \
   "$destination:$(remote_path "$worktree")/" "$worktree/" || copy_rc=$?
+for path in "${sync_paths[@]}"; do
+  ((copy_rc != 0)) || rsync_to --update --mkpath --ignore-missing-args "$destination:$(remote_path "$path")/" "$path/" || copy_rc=$?
+done
 if ((copy_rc != 0)); then
   printf 'remote-run: copying the work back from %s failed (rsync exit %s) after the adapter exited %s; the remote work stays at %s:%s\n' \
     "$destination" "$copy_rc" "$rc" "$destination" "$(remote_path "$worktree")" >&2

@@ -52,6 +52,23 @@ exec "${mapped[@]}"
 """
 
 
+# A run prefix that also adds a file to a synced folder on the executor, as a worker recording a golden file would.
+SYNC_RUN = """\
+#!/usr/bin/env bash
+root=$1
+shift
+printf 'recorded on the executor\\n' > "$root$SYNC_DIR/recorded.txt"
+mapped=()
+for argument in "$@"; do
+  case $argument in
+    /*) mapped+=("$root$argument") ;;
+    *) mapped+=("$argument") ;;
+  esac
+done
+exec "${mapped[@]}"
+"""
+
+
 class RemoteExecutorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="agentic-remote-")
@@ -76,9 +93,9 @@ class RemoteExecutorTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def repo(self, workers=1):
+    def repo(self, workers=1, **fields):
         executor = {"name": "box", "ssh": "box", "workers": workers, "root": str(self.root),
-                    "run": [str(self.run_prefix), str(self.root)], "exclude": ["node_modules/"]}
+                    "run": [str(self.run_prefix), str(self.root)], "exclude": ["node_modules/"], **fields}
         repo = Repo(settings={"executors": [executor]})
         self.repos.append(repo)
         (repo.root / ".gitignore").write_text("node_modules/\n")
@@ -111,6 +128,23 @@ class RemoteExecutorTests(unittest.TestCase):
         result = repo.command("run", "--provider", "mock", "--workers", "1", *options, cwd=repo.worktree, check=False, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
+
+    def test_sync_paths_go_before_the_run_and_come_back_without_deleting(self):
+        synced = Path(self.temp.name) / "recordings"
+        synced.mkdir()
+        (synced / "kept.txt").write_text("recorded here\n")
+        (synced / "local-only.txt").write_text("never deleted\n")
+        run = self.tool(Path(self.temp.name) / "bin" / "sync-run", SYNC_RUN)
+        repo = self.repo(sync_paths=[str(synced)], run=[str(run), str(self.root)])
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        repo.env["SYNC_DIR"] = str(synced)
+        (self.remote(synced)).mkdir(parents=True)
+        (self.remote(synced) / "stale-remote.txt").write_text("stays on the executor\n")
+        self.run_campaign(repo)
+        self.assertEqual(self.remote(synced / "kept.txt").read_text(), "recorded here\n")
+        self.assertEqual((synced / "recorded.txt").read_text(), "recorded on the executor\n")
+        self.assertTrue((synced / "local-only.txt").exists())
+        self.assertTrue(self.remote(synced / "stale-remote.txt").exists())
 
     def test_a_remote_worker_change_and_deletion_reach_integration_and_the_reviewer_stays_local(self):
         repo = self.repo()
@@ -287,6 +321,7 @@ class ExecutorSettingsTests(unittest.TestCase):
             "run must be a list": {"executors": [dict(good, run="wrap")]},
             "exclude must be a list": {"executors": [dict(good, exclude=[""])]},
             "rsync_options must be a list": {"executors": [dict(good, rsync_options="--chmod=g+w")]},
+            "sync_paths must be a list of absolute paths": {"executors": [dict(good, sync_paths=["recordings"])]},
             "unknown field": {"executors": [dict(good, worker=2)]},
             "is not unique": {"executors": [good, dict(good, workers=2)]},
         }
