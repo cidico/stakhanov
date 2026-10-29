@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -192,7 +193,11 @@ def update_status(path: Path, expected_id: str, status: str):
     replaced, count = re.subn(r"(?m)^status:\s*[^\n]+$", f"status: {status}", head, count=1)
     if count != 1:
         raise TicketError(f"{path}: status field is not unique")
-    path.write_text(replaced + marker + body, encoding="utf-8")
+    # Written beside the ticket and moved over it, so a reader never sees the file empty or half written.
+    staged = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    staged.write_text(replaced + marker + body, encoding="utf-8")
+    os.chmod(staged, path.stat().st_mode & 0o7777)
+    os.replace(staged, path)
 
 
 def main() -> int:
