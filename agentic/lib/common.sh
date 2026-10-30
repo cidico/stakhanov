@@ -189,6 +189,8 @@ repo_id() {
 
 runtime_base() {
   local base=${AGENTIC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/agentic}
+  # Git records worktrees by their physical path: a cache reached through a symlink would never match them.
+  base=$(realpath -m -- "$base")
   printf '%s/%s\n' "${base%/}" "$(repo_id)"
 }
 

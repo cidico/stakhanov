@@ -440,6 +440,21 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn("campaign/harness-sample", self.repo.git("branch", "--list").stdout)
         self.assertTrue((self.repo.root / "product-TST-001.txt").is_file())
 
+    def test_a_symlinked_cache_still_removes_ticket_worktrees_and_finalizes(self):
+        # Git records worktrees by their physical path; a cache reached through a symlink must still match them.
+        link = Path(self.repo.cache.name + "-link")
+        link.symlink_to(self.repo.cache.name)
+        self.addCleanup(link.unlink)
+        self.repo.env["AGENTIC_CACHE"] = str(link)
+        self.repo.init_campaign(); self.repo.configure([ticket()]); self.repo.mock_provider()
+        (self.repo.root / "SPEC.md").unlink(missing_ok=True)
+        run = self.repo.command("run", "--provider", "mock", cwd=self.repo.worktree, check=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.repo.git("branch", "--list", "agentic/*").stdout.strip(), "")
+        result = self.repo.command("finalize", cwd=self.repo.worktree, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("campaign/harness-sample", self.repo.git("branch", "--list").stdout)
+
     def test_finalize_drains_large_worktree_inventory(self):
         self.repo.init_campaign(); self.repo.configure([ticket(status="done")])
         (self.repo.root / "SPEC.md").unlink(missing_ok=True)
