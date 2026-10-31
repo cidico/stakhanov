@@ -518,6 +518,20 @@ esac
         self.assertEqual(result.returncode, 3)
         self.assertIn("the preflight of claude fails on box: missing option --json-schema", result.stdout)
 
+    def test_a_missing_claude_account_hook_is_pending(self):
+        self.with_claude_skill()
+        self.mock_provider_on("box", "installed", "signed-in")
+        result = self.join(check=False, env={"AGENTIC_CLAUDE_ACCOUNTS": "no-such-hook"})
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("the claude account hook no-such-hook (AGENTIC_CLAUDE_ACCOUNTS) is not installed on box", result.stdout)
+        # Installed for the user there (~/.local/bin), it is found and nothing is pending.
+        hook = self.hosts / "box" / "home" / ".local" / "bin" / "some-hook"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+        result = self.join(env={"AGENTIC_CLAUDE_ACCOUNTS": "some-hook"})
+        self.assertIn("every command works there", result.stdout)
+
     def restricted_path(self, name, without, extra=None):
         """A PATH for the fake machine NAME with every system command but WITHOUT, plus the EXTRA scripts."""
         folder = self.hosts / name / "bin"

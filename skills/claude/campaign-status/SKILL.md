@@ -37,6 +37,7 @@ Phases of an in-progress ticket (`phase` → label → next step). Report the la
 | recovering | ♻️ automatic recovery | reimplement with the diagnosis |
 | resolving-conflict | 🔀 resolving an integration conflict | validation → review |
 | provider-error | ⚠️ provider error | recovery or runner pause |
+| waiting-for-quota | ⏳ waiting for quota (every account is out; `phase_note` says until when) | runs again when an account is back |
 
 Any other value: show it as-is with ⚙️.
 

@@ -49,7 +49,8 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `AGENTIC_CODEX_EFFORT`, `AGENTIC_CODEX_{WORKER,REVIEWER,DIAGNOSTICIAN}_EFFORT` | Codex effort (default `medium` for workers, `high` for the others). |
 | `AGENTIC_GROK_MODEL` | Grok model; unset means the CLI default. |
 | `AGENTIC_GROK_EFFORT`, `AGENTIC_GROK_{WORKER,REVIEWER,DIAGNOSTICIAN}_EFFORT` | Grok effort (default `medium` for workers, `high` for the others). |
-| `AGENTIC_CLAUDE_ACCOUNTS` | Account hook command of the Claude adapter (for example `udarnik`); see `providers/claude/README.md`. Unset: claude runs in the caller's account. |
+| `AGENTIC_CLAUDE_ACCOUNTS` | Account hook command of the Claude adapter (for example `udarnik`); see `providers/claude/README.md`. Unset: claude runs in the caller's account. `campaign run` says when it is missing or off on this machine; `fleet join` lists it as pending when it is missing on the new machine. |
+| `AGENTIC_QUOTA_MIN_WAIT_SECONDS` | Shortest wait for quota when every account is out (default 60). |
 | `AGENTIC_EXECUTORS` | `local` runs every worker on this machine whatever `executors` declares. Any other non-empty value is an error. |
 | `AGENTIC_SSH` | The ssh command for the executors (default `ssh`), also rsync's `-e` and git's transport. It is split on spaces, so it may carry options. |
 | `AGENTIC_SUPERVISOR` | `off` never installs the supervisor (tests, CI). |
@@ -138,10 +139,13 @@ Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid`, `cmp` (dif
   kill), emits `provider-timeout`, preserves the delta and evidence, and does not retry automatically.
   Diagnose the evidence and recover explicitly after a concrete correction. A live PID or network
   activity is not proof of progress and never extends the deadline.
-- A usage-limit failure is an ordinary provider failure: the invocation is repeated once, then `harness-error`
-  pauses the ticket with its delta preserved. The runner does not wait for the limit to reset; recover the
-  ticket (`campaign recover`) once it has. With `AGENTIC_CLAUDE_ACCOUNTS` the Claude adapter first retries once
-  in another account (`providers/claude/README.md`).
+- Without an account hook, a usage-limit failure is an ordinary provider failure: the invocation is repeated once,
+  then `harness-error` pauses the ticket with its delta preserved; recover it (`campaign recover`) once the limit has
+  reset. With `AGENTIC_CLAUDE_ACCOUNTS` the Claude adapter first retries once in another account, and when no account
+  is left it exits 75 with the time the first one is back (`providers/claude/README.md`). The runner then waits for
+  that time (`provider-quota-wait`, at least `AGENTIC_QUOTA_MIN_WAIT_SECONDS`; 15 minutes when the time is unknown)
+  and runs the same invocation again without spending an attempt (`provider-quota-back`). A stop request ends the
+  wait; the ticket keeps its product status and delta for the next run.
 - Validation commands have no deadline. A stuck test holds its phase until someone kills it; find the process in
   the runner's process tree. The deadlines above limit only provider invocations.
 

@@ -395,6 +395,7 @@ printf '%s\n' "$*" >> "$HOOK_CALLS/hook.log"
 case "$1 $2" in
   'account enabled') [[ ${HOOK_ENABLED:-1} == 1 ]] ;;
   'account current') printf '%s\n' "$HOOK_A" ;;
+  'account next') printf '%s\n' "${HOOK_NEXT:-1900000000}" ;;
   'account env')
     if [[ $3 == "$HOME/.claude" ]]; then printf 'env -u CLAUDE_CONFIG_DIR\n'; else printf 'env CLAUDE_CONFIG_DIR=%q\n' "$3"; fi ;;
   'account limit')
@@ -429,11 +430,11 @@ assert_command 'Account hook: a usage limit retries once in the next account wit
 assert_command 'Account hook: the retry event names both accounts and only the retry hears about the cut-off work' \
   bash -c 'jq -e -s "any(.[]; .state == \"account\" and (.message | test(\"account claude-a hit its usage limit; retrying once in account claude-b two\")))" "$1" >/dev/null && ! grep -q "cut off by a provider usage limit" "$2/1.prompt" && grep -q "cut off by a provider usage limit" "$2/2.prompt"' _ \
   "$runtime/hook-limit-events.jsonl" "$hook_calls"
-assert_command 'Account hook: exit 75 (no account left) fails the role as before' \
-  bash -c 'hook_run none HOOK_LIMITED="$2" HOOK_NONE_LEFT=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 1 && ! -e $3 ]] && grep -q "hit your weekly limit" "$4" && jq -e -s "any(.[]; .state == \"account\" and (.message | test(\"no other account\")))" "$5" >/dev/null' _ \
+assert_command 'Account hook: no account left exits 75 and says when the first account is back' \
+  bash -c 'hook_run none HOOK_LIMITED="$2" HOOK_NONE_LEFT=1 HOOK_NEXT=1900000123; code=$?; [[ $code == 75 && $(hook_calls_count) == 1 && ! -e $3 ]] && grep -q "hit your weekly limit" "$4" && grep -q "accounts-back-at=1900000123" "$4" && jq -e -s "any(.[]; .state == \"account\" and (.message | test(\"no other account\")))" "$5" >/dev/null' _ \
   "$hook_calls" "$hook_a" "$runtime/hook-none-result.json" "$runtime/hook-none-stderr" "$runtime/hook-none-events.jsonl"
-assert_command 'Account hook: a second usage limit is reported to the hook but not retried' \
-  bash -c 'hook_run all HOOK_LIMIT_ALL=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 2 && $(grep -c "^account limit" "$1/hook.log") == 2 ]]' _ "$hook_calls"
+assert_command 'Account hook: a second usage limit is reported to the hook, not retried, and exits 75 when no account is left' \
+  bash -c 'hook_run all HOOK_LIMIT_ALL=1; code=$?; [[ $code == 75 && $(hook_calls_count) == 2 && $(grep -c "^account limit" "$1/hook.log") == 2 ]] && grep -q "accounts-back-at=1900000000" "$2"' _ "$hook_calls" "$runtime/hook-all-stderr"
 assert_command 'Account hook: a failure that is not a usage limit is not retried' \
   bash -c 'hook_run other HOOK_OTHER_ERROR=1; code=$?; [[ $code == 1 && $(hook_calls_count) == 1 ]] && grep -q "overloaded" "$2"' _ \
   "$hook_calls" "$runtime/hook-other-stderr"

@@ -242,6 +242,14 @@ class Repo:
             if [ "$role" = worker ] && echo "$result" | grep -q -- '-worker.json$'; then status=${MOCK_WORKER:-PASS}; fi
             if [ "$role" = worker ] && [ "${MOCK_FAIL_TICKET:-}" = "$ticket" ] && echo "$result" | grep -q -- '-worker.json$'; then status=FAILED; fi
             if [ "$role" = diagnostician ]; then status=${MOCK_DIAGNOSIS:-PASS}; fi
+            if [ -n "${MOCK_QUOTA_ONCE:-}" ]; then
+              mkdir -p "$MOCK_QUOTA_ONCE"
+              if [ ! -f "$MOCK_QUOTA_ONCE/$ticket-$role" ]; then
+                touch "$MOCK_QUOTA_ONCE/$ticket-$role"
+                echo "claude adapter: every account is out of quota; accounts-back-at=$(( $(date +%s) + ${MOCK_QUOTA_SECONDS:-1} ))" >&2
+                exit 75
+              fi
+            fi
             if [ "$role" = worker ] && [ -n "${MOCK_BLOCK_ONCE:-}" ] && echo "$result" | grep -q -- '-worker.json$'; then
               mkdir -p "$MOCK_BLOCK_ONCE"
               if [ ! -f "$MOCK_BLOCK_ONCE/$ticket" ]; then touch "$MOCK_BLOCK_ONCE/$ticket"; status=BLOCKED; fi

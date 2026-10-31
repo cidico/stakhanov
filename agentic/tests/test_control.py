@@ -133,6 +133,40 @@ class ControlTests(unittest.TestCase):
         self.assertEqual((overview["worktree"], overview["project"], overview["open"]), (tree, str(self.repo.root), f"cd {tree} && mock"))
         self.assertIn(f"  open: cd {tree} && mock", self.repo.command("overview").stdout)
 
+    def test_a_ticket_waits_for_quota_and_runs_again_without_spending_an_attempt(self):
+        self.repo.configure([ticket()])
+        self.repo.mock_provider()
+        self.repo.env.update(MOCK_QUOTA_ONCE=str(Path(self.repo.cache.name) / "quota"), MOCK_QUOTA_SECONDS="2",
+                             AGENTIC_QUOTA_MIN_WAIT_SECONDS="1")
+        self.run_campaign()
+        self.wait(lambda: not self.status()["runner"]["active"], seconds=60, message="the run to end")
+        self.assertEqual(self.states(), {"TST-001": "done"})
+        types = [event["type"] for event in self.events()]
+        self.assertIn("provider-quota-wait", types)
+        self.assertIn("provider-quota-back", types)
+        self.assertNotIn("provider-failed", types)
+        waits = [e["message"] for e in self.events() if e["type"] == "provider-quota-wait"]
+        self.assertIn("out of quota; the ticket waits until", waits[0])
+
+    def test_a_stop_ends_the_wait_for_quota_and_keeps_the_ticket_for_the_next_run(self):
+        self.repo.configure([ticket()])
+        self.repo.mock_provider()
+        self.repo.env.update(MOCK_QUOTA_ONCE=str(Path(self.repo.cache.name) / "quota"), MOCK_QUOTA_SECONDS="600")
+        self.run_campaign()
+        self.wait(lambda: "provider-quota-wait" in [e["type"] for e in self.events()], message="the wait for quota")
+        progress = json.loads(self.repo.command("overview", "--json").stdout)["campaigns"][0]["tickets"][0]
+        self.assertEqual(progress["phase"], "waiting-for-quota")
+        self.assertIn("the ticket waits until", progress["phase_note"])
+        self.repo.command("stop", cwd=self.repo.worktree)
+        self.wait(lambda: not self.status()["runner"]["active"], seconds=40, message="the runner to stop")
+        self.assertIn("stop requested during the wait for quota",
+                      " ".join(e["message"] for e in self.events() if e["type"] == "provider-quota-wait"))
+        self.assertNotEqual(self.states()["TST-001"], "done")
+        self.repo.env.update(MOCK_QUOTA_SECONDS="1", AGENTIC_QUOTA_MIN_WAIT_SECONDS="1")
+        self.run_campaign()
+        self.wait(lambda: not self.status()["runner"]["active"], seconds=60, message="the next run to end")
+        self.assertEqual(self.states(), {"TST-001": "done"})
+
     def test_restart_needs_a_previous_run_or_a_provider(self):
         self.repo.configure([ticket()])
         result = self.repo.command("restart", cwd=self.repo.worktree, check=False)

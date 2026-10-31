@@ -130,7 +130,10 @@ The settings (`.agentic/project.json`) and every `AGENTIC_*` environment variabl
 committed copy.
 
 Claude accounts: `AGENTIC_CLAUDE_ACCOUNTS=udarnik` (or any command with the same `account` subcommands) lets the Claude
-adapter run in the hook's current account and retry once in another one after a usage limit.
+adapter run in the hook's current account and retry once in another one after a usage limit. When every account is
+out of quota, the ticket waits until the first one is back and runs again, without spending an attempt. `campaign
+run` says when the hook is missing or off on the machine, and `fleet join` leaves it as a pending item when it is
+missing there.
 
 ## Controlling a campaign
 

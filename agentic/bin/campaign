@@ -348,6 +348,29 @@ remote_run_arguments() {
   for key in "${PROJECT_ENV_KEYS[@]}"; do printf '%s\n' --env "$key"; done
 }
 
+# wait_for_quota TICKET LOG ROLE: waits until the time the adapter's log gives (accounts-back-at=EPOCH; at least
+# AGENTIC_QUOTA_MIN_WAIT_SECONDS, 60 by default; 15 minutes when the time is unknown). A stop request ends the wait
+# (status 1): the ticket keeps its product status and delta for the next run.
+wait_for_quota() {
+  local ticket=$1 log=$2 role=$3 slug back now floor remaining
+  slug=$(campaign_slug); now=$(date +%s); floor=$((now + ${AGENTIC_QUOTA_MIN_WAIT_SECONDS:-60}))
+  back=$(grep -o 'accounts-back-at=[0-9]*' "$log" | tail -n 1 | cut -d= -f2)
+  if [[ ! $back =~ ^[0-9]+$ ]] || ((back == 0)); then back=$((now + 900)); fi
+  ((back >= floor)) || back=$floor
+  event provider-quota-wait "role=$role every account of the provider is out of quota; the ticket waits until $(in_display_tz date -d "@$back" '+%H:%M (%d/%m)') and runs again" "$ticket"
+  while (($(date +%s) < back)); do
+    if [[ $(desired_state "$slug") == stopped ]]; then
+      event provider-quota-wait "role=$role stop requested during the wait for quota; product status and delta preserved for the next run" "$ticket"
+      return 1
+    fi
+    remaining=$((back - $(date +%s)))
+    ((remaining <= 15)) || remaining=15
+    ((remaining > 0)) || remaining=1
+    sleep "$remaining"
+  done
+  event provider-quota-back "role=$role the wait for quota is over; the invocation runs again" "$ticket"
+}
+
 invoke_provider() {
   local provider=$1 role=$2 worktree=$3 ticket=$4 suffix=$5 extra=${6:-}
   local runtime adapter prompt result events log rc timeout_seconds started elapsed executor=local reason
@@ -390,6 +413,12 @@ invoke_provider() {
     event executor-unavailable "executor=$executor ${reason:-executor unavailable}; the ticket runs locally for the rest of this run" "$ticket"
     executor=local
     printf 'local\n' >"$runtime/state/$ticket.executor"
+    continue
+  fi
+  # Every account of the provider is out of quota (the adapter exits 75 and says when one is back): the same
+  # invocation waits for it and runs again, without spending an attempt.
+  if [[ $executor == local ]] && ((rc == 75)) && grep -q 'accounts-back-at=' "$log" 2>/dev/null; then
+    wait_for_quota "$ticket" "$log" "$role" || return 3
     continue
   fi
   if ((rc == 124)); then
@@ -1036,6 +1065,18 @@ mark_finalized() {
   chmod 600 "$file"
 }
 
+# A claude campaign whose project names an account hook (AGENTIC_CLAUDE_ACCOUNTS) says when the hook is missing or off
+# here: claude then runs in one account and stops at its usage limit.
+account_hook_note() {
+  local hook=${AGENTIC_CLAUDE_ACCOUNTS:-}
+  [[ $1 == claude && -n $hook ]] || return 0
+  if ! command -v "$hook" >/dev/null 2>&1; then
+    note "Warning: the account hook $hook (AGENTIC_CLAUDE_ACCOUNTS) is not installed on $(machine_name): claude runs in its default account, with no other account to take over at its usage limit."
+  elif ! "$hook" account enabled >/dev/null 2>&1; then
+    note "Account hook $hook is off on $(machine_name): claude runs in its default account until it is on ($hook start)."
+  fi
+}
+
 cmd_run() {
   assert_campaign_branch
   local provider='' mode=interactive workers=2 arg runtime slug child
@@ -1110,6 +1151,7 @@ cmd_run() {
   fi
   note "Worktree: $REPO_ROOT ($(machine_name))"
   note "Open: $(open_command "$REPO_ROOT" "$provider")"
+  account_hook_note "$provider"
   if [[ $mode == interactive ]]; then
     # The follower is disposable: closing the UI never signals the detached engine.
     tail -n +1 --pid="$child" -f "$runtime/events/campaign.ndjson" || true
@@ -1782,7 +1824,9 @@ ticket_progress() {
       | ([range($mine | length) | select($mine[.].type == "ticket-started")]) as $starts
       | {id, status, risk, depends_on, goal}
       + (if $ticket.status == "in-progress" and ($starts | length) > 0 then
-          $mine[-1] as $last | ($last | role) as $role
+          # Back from a wait for quota, the invocation runs again: the same phase as when it started.
+          ($mine[-1] | if .type == "provider-quota-back" then .type = "provider-started" else . end) as $last
+          | ($last | role) as $role
           | ($mine[$starts[-1]:] | any(.type == "provider-completed" and role == "reviewer")) as $reviewed
           | {executor: ($ticket.executor // "local"),
              started_local_time: $mine[$starts[0]].local_time,
@@ -1797,7 +1841,9 @@ ticket_progress() {
                        then "recovering"
                      elif $last.type == "integration-conflict" then "resolving-conflict"
                      elif ($last.type | IN("provider-failed", "provider-timeout", "harness-error")) then "provider-error"
+                     elif $last.type == "provider-quota-wait" then "waiting-for-quota"
                      else $last.type end),
+             phase_note: (if $last.type == "provider-quota-wait" then $last.message else null end),
              phase_local_time: $last.local_time,
              phase_seconds: ((now - ($last.time | seconds)) | floor),
              unblocks: [$all[] | select(.status == "todo" and any(.depends_on[]; . == $ticket.id))

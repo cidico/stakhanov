@@ -80,8 +80,10 @@ arguments=(
 # Optional account hook, compatible with udarnik: AGENTIC_CLAUDE_ACCOUNTS names a command. While `<command> account
 # enabled` succeeds, claude runs in the account `<command> account current` names, through the env prefix of `<command>
 # account env ACCOUNT`. A failure goes to `<command> account limit ACCOUNT` on stdin: when it was a usage limit and the
-# hook prints another account, the same invocation runs once more there (exit 75: no account is left). Unset or
-# disabled, claude runs in the caller's account.
+# hook prints another account, the same invocation runs once more there. When no account is left (the hook exits 75)
+# the adapter exits 75 and its stderr says when the first account is back (`accounts-back-at=EPOCH`, from `<command>
+# account next`), so the runner waits instead of spending an attempt. Unset or disabled, claude runs in the caller's
+# account.
 accounts=${AGENTIC_CLAUDE_ACCOUNTS:-}
 account=''
 account_env=()
@@ -118,6 +120,7 @@ run_claude() {
 
 provider_event started 'fresh process started'
 run_claude
+no_account=false
 if (( exit_code != 0 )) && [[ -n $accounts ]]; then
   limit_status=0
   next=$(command cat -- "$raw_result" "$temporary_dir/stderr" 2>/dev/null | "$accounts" account limit "$account") || limit_status=$?
@@ -129,14 +132,26 @@ if (( exit_code != 0 )) && [[ -n $accounts ]]; then
     run_claude
     # Keep the hook's account state true when the second account is out too; there is no further retry.
     if (( exit_code != 0 )); then
-      command cat -- "$raw_result" "$temporary_dir/stderr" 2>/dev/null | "$accounts" account limit "$account" >/dev/null 2>&1 || true
+      limit_status=0
+      command cat -- "$raw_result" "$temporary_dir/stderr" 2>/dev/null | "$accounts" account limit "$account" >/dev/null 2>&1 || limit_status=$?
+      if (( limit_status == 75 )); then
+        provider_event account "account $(account_key "$account") hit its usage limit too and no other account is available"
+        no_account=true
+      fi
     fi
   elif (( limit_status == 75 )); then
     provider_event account "account $(account_key "$account") hit its usage limit and no other account is available"
+    no_account=true
   fi
 fi
 if (( exit_code != 0 )); then
   provider_failed "$exit_code" "$temporary_dir/stderr" "$raw_result" || true
+  if $no_account; then
+    back=$("$accounts" account next 2>/dev/null) || back=''
+    [[ $back =~ ^[0-9]+$ ]] || back=0
+    printf 'claude adapter: every account is out of quota; accounts-back-at=%s\n' "$back" >&2
+    exit 75
+  fi
   exit "$exit_code"
 fi
 provider_finish "$raw_result"

@@ -183,6 +183,12 @@ SCRIPT
 
 # PATH PROVIDER MODE: the provider's adapter in the clone at PATH, in MODE (--ready, --install, --login or
 # --preflight unattended). AGENTIC_PROVIDER_DIR replaces the clone's adapters, as for the runner.
+# Whether the command $1 is installed for the user (with ~/.local/bin, where per-user tools usually are).
+read -r -d '' FLEET_COMMAND <<'SCRIPT' || true
+export PATH="$PATH:$HOME/.local/bin"
+command -v "$1" >/dev/null 2>&1
+SCRIPT
+
 read -r -d '' FLEET_PROVIDER <<'SCRIPT' || true
 export PATH="$PATH:$HOME/.local/bin"
 cd -- "$1" || exit 1
@@ -609,6 +615,12 @@ fleet_ready_providers() {
       note "$provider is ready on $machine."
     else
       pending+=("the preflight of $provider fails on $machine: $(fleet_reason "$fleet_temp/preflight.error")")
+    fi
+    # The account hook the project names for claude (AGENTIC_CLAUDE_ACCOUNTS, for example udarnik) is part of what
+    # makes claude usable there: without it claude runs in one account and stops at that account's usage limit.
+    if [[ $provider == claude && -n ${AGENTIC_CLAUDE_ACCOUNTS:-} ]] \
+        && ! remote_script "$FLEET_COMMAND" "$AGENTIC_CLAUDE_ACCOUNTS" >/dev/null 2>&1; then
+      pending+=("the claude account hook $AGENTIC_CLAUDE_ACCOUNTS (AGENTIC_CLAUDE_ACCOUNTS) is not installed on $machine: install it there; until then claude runs in one account there and stops at its usage limit")
     fi
   done < <(fleet_project_providers)
 }
