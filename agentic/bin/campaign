@@ -19,6 +19,11 @@ Commands:
   status [--json]                 Show ticket and runner state
   ready [--json]                  Show READY tickets (todo with done dependencies)
   run --provider NAME [options]   Run or attach to a campaign
+  stop [--now]                    Start no new ticket and stop when the running ones end (--now: stop at once)
+  restart [--now] [options]       Stop (at once with --now), then run again with the last run's settings
+  move --to MACHINE [--now] [--start|--no-start]
+                                  Move the campaign to another machine of the fleet, with its uncommitted work
+  watch [campaign-watch options]  Wait until the campaign needs its coordinator (campaign-watch)
   decide TICKET DECISION          Resolve a pending retry/block/cancel decision
   recover TICKET                 Reuse existing delta for validation and fresh review
   finalize                        Gate, clean, rebase and FF-only merge into the main branch
@@ -27,9 +32,18 @@ Commands:
   queue start FILE [--foreground] Run campaigns in sequence (init → run → finalize), resumable
   queue status [NAME] [--json]    Show queue progress
   queue stop NAME                 Stop a queue supervisor (runners keep going)
-  overview [--json]               Every campaign and queue in the cache, for the status skill
+  overview [--json] [--fleet]     Every campaign and queue in the cache, for the status skill (--fleet: on every
+                                  machine of the project's fleet)
+  fleet [--json]                  The machines of the project's fleet, and how their main branches compare
+  fleet join NAME --ssh DEST      Add a machine to the fleet, cloning the project there
+        [--path PATH] [--as NAME] [--as-ssh DEST]
+  fleet leave NAME                Remove a machine from the fleet
 
 Run options: --mode interactive|unattended, --workers 1..3 (default 2)
+
+status, stop, run, restart, decide, recover, watch and move also take --campaign SLUG [--on MACHINE]: they then act
+on that campaign wherever it is in the project's fleet (on MACHINE when given), from any worktree. finalize --campaign
+SLUG first moves the campaign to this machine, then finalizes it into this machine's main branch.
 EOF
 }
 
@@ -71,12 +85,14 @@ cmd_init() {
   require_committed_kit
   branch="campaign/$slug"
   git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch" && die "campaign branch already exists: $branch"
+  fleet_lib
+  fleet_init_check "$slug"
 
   runtime=$(ensure_runtime "$slug")
   worktree="$runtime/worktrees/campaign"
   [[ ! -e $worktree ]] || die "campaign worktree path already exists: $worktree"
   git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree" "$MAIN_BRANCH" >/dev/null
-  rm -f -- "$(finalized_marker "$slug")"
+  rm -f -- "$(finalized_marker "$slug")" "$(runtime_base)/moved/$slug.json"
   canonical="$worktree/campaigns/$slug/SPEC.md"
   mkdir -p -- "$worktree/campaigns/$slug/tickets"
   cp -- "$spec" "$canonical"
@@ -200,7 +216,7 @@ active_executors() {
 
 cmd_status() {
   assert_campaign_branch
-  local json=false slug tickets runtime active=false pid='' decisions='[]'
+  local json=false slug tickets runtime active=false pid='' decisions='[]' desired
   [[ ${1:-} == --json ]] && json=true
   slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
   tickets=$(python3 "$TICKET_TOOL" list "$(tickets_path "$slug")")
@@ -218,13 +234,15 @@ cmd_status() {
   if compgen -G "$runtime/decisions/*.json" >/dev/null; then
     decisions=$(jq -s '.' "$runtime"/decisions/*.json)
   fi
+  desired=$(desired_state "$slug")
   if $json; then
-    jq -cn --arg slug "$slug" --argjson active "$active" --arg pid "$pid" \
+    jq -cn --arg slug "$slug" --argjson active "$active" --arg pid "$pid" --arg desired "$desired" \
       --argjson tickets "$tickets" --argjson decisions "$decisions" \
-      '{campaign:$slug,runner:{active:$active,pid:(if $pid=="" then null else ($pid|tonumber) end)},tickets:$tickets,decisions:$decisions}'
+      '{campaign:$slug,runner:{active:$active,pid:(if $pid=="" then null else ($pid|tonumber) end),desired:$desired},tickets:$tickets,decisions:$decisions}'
   else
     note "Campaign: $slug"
-    note "Runner: $(if $active; then printf 'active (pid %s)' "$pid"; else printf 'inactive'; fi)"
+    note "Runner: $(if $active; then printf 'active (pid %s)' "$pid"; else printf 'inactive'; fi)$(
+      [[ $desired != stopped ]] || { $active && printf ', stopping' || printf ', stopped'; })"
     jq -r '.[] | "\(.id)\t\(.status)\t\(.risk)\(if .executor then "\texecutor=\(.executor)" else "" end)"' <<<"$tickets"
     jq -r '.[] | "DECISION\t\(.ticket)\t\(.reason)\toptions=\(.options|join(","))"' <<<"$decisions"
   fi
@@ -842,7 +860,10 @@ engine_loop() {
   flock -w 1 8 || die "runner already active for $slug"
   printf '%s\n' "$$" >"$runtime/runner.pid"
   chmod 600 "$runtime/runner.pid"
-  trap "rm -f -- '$runtime/runner.pid'" EXIT INT TERM
+  trap "rm -f -- '$runtime/runner.pid'" EXIT
+  # Stopped (campaign stop --now): end here, without going on from the interrupted wait.
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
   # Capacity is the local workers plus every executor's. A starting ticket takes the first executor (in settings order)
   # with a free slot, else a local one, and keeps that slot until it ends, even when it goes on locally because its
   # executor became unavailable.
@@ -872,7 +893,7 @@ engine_loop() {
     ready=$(jq --argjson ids "$failed_ids" '[.[] | select((.id as $id | $ids | index($id)) == null)]' <<<"$ready")
     active_json=$(printf '%s\n' "${jobs[@]:-}" | jq -Rsc 'split("\n") | map(select(length>0))')
     ready=$(jq --argjson active "$active_json" '[.[] | select((.id as $id | $active | index($id)) == null)]' <<<"$ready")
-    while ((running < capacity)) && (($(jq 'length' <<<"$ready") > 0)); do
+    while ((running < capacity)) && (($(jq 'length' <<<"$ready") > 0)) && [[ $(desired_state "$slug") != stopped ]]; do
       candidate=''; occupied=$'\n'
       for pid in "${!job_domains[@]}"; do occupied+="${job_domains[$pid]}"$'\n'; done
       while (($(jq 'length' <<<"$ready") > 0)); do
@@ -921,6 +942,10 @@ engine_loop() {
         event harness-error 'pipeline unavailable; product status and delta preserved' "$ticket"
       fi
       continue
+    fi
+    if [[ $(desired_state "$slug") == stopped ]]; then
+      event runner-stopped 'stopped on request: no new ticket started and the running ones ended'
+      break
     fi
     statuses=$(scan_tickets list "$(tickets_path)")
     if jq -e 'all(.[]; .status == "done" or (.required == false))' >/dev/null <<<"$statuses"; then
@@ -1028,12 +1053,24 @@ cmd_run() {
   exec 6>"$runtime/launcher.lock"
   flock -x 6
   if runner_alive "$slug"; then
+    if [[ $(desired_state "$slug") == stopped ]]; then
+      set_desired_state "$slug" running
+      event stop-cancelled 'run again before the runner stopped: it goes on starting tickets'
+      note "The stop of $slug is cancelled: the runner goes on."
+    fi
     note "Runner already active; attaching to $slug."
     cmd_status
     return
   fi
-  jq -cn --arg provider "$provider" --arg mode "$mode" --argjson workers "$workers" \
-    '{provider:$provider,mode:$mode,workers:$workers}' >"$runtime/run-config.json"
+  [[ -z $(jq -r '.moving // ""' "$runtime/campaign.json" 2>/dev/null) ]] \
+    || die "campaign $slug is moving to $(jq -r '.moving' "$runtime/campaign.json")"
+  set_desired_state "$slug" running
+  ensure_supervisor
+  # What a relaunch by the supervisor repeats: the provider, the workers and the AGENTIC_* settings of this run.
+  jq -cn --arg provider "$provider" --arg mode "$mode" --argjson workers "$workers" --arg queue "${AGENTIC_QUEUE:-}" \
+    '{provider:$provider,mode:$mode,workers:$workers,queue:(if $queue == "" then null else $queue end),
+      env:($ENV | with_entries(select(.key | startswith("AGENTIC_")) | select(.key != "AGENTIC_SUPERVISED" and .key != "AGENTIC_QUEUE")))}' \
+    >"$runtime/run-config.json"
   chmod 600 "$runtime/run-config.json"
   touch "$runtime/events/campaign.ndjson"
   require_green_baseline "$runtime"
@@ -1073,6 +1110,181 @@ cmd_run() {
   else
     note "Use 'campaign status' to attach."
   fi
+}
+
+# The pids to signal for the engine PID: every process of its systemd scope when it runs in one of its own (campaign run
+# puts it there), else PID and its descendants.
+engine_pids() {
+  local pid=$1 cgroup
+  cgroup=$(awk -F: '$1 == "0" {print $3}' "/proc/$pid/cgroup" 2>/dev/null) || cgroup=''
+  if [[ $cgroup == */agentic-campaign-*.scope && -d /sys/fs/cgroup$cgroup ]]; then
+    find "/sys/fs/cgroup$cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null | grep -vx "$$" || true
+    return
+  fi
+  ps -e -o pid=,ppid= | awk -v root="$pid" '
+    { parent[$1] = $2; alive[$1] = 1 }
+    END {
+      keep[root] = 1
+      do { changed = 0; for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; changed = 1 } } while (changed)
+      for (p in keep) if (p in alive) print p
+    }'
+}
+
+# stop_engine PID: TERM to the engine and everything it started, KILL after 10 seconds to what is left.
+stop_engine() {
+  local pid=$1 pids attempt
+  pids=$(engine_pids "$pid" | paste -sd' ')
+  [[ -n $pids ]] || return 0
+  IFS=' ' read -r -a pids <<<"$pids"
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  for attempt in {1..50}; do
+    [[ -n $(engine_pids "$pid") ]] || return 0
+    sleep 0.2
+  done
+  pids=$(engine_pids "$pid" | paste -sd' ')
+  [[ -z $pids ]] || { IFS=' ' read -r -a pids <<<"$pids"; kill -KILL "${pids[@]}" 2>/dev/null || true; }
+}
+
+cmd_stop() {
+  assert_campaign_branch
+  local now=false arg slug runtime pid=''
+  for arg in "$@"; do
+    case $arg in --now) now=true ;; *) die "unknown stop option: $arg" ;; esac
+  done
+  slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
+  set_desired_state "$slug" stopped
+  if ! runner_alive "$slug"; then
+    note "The runner of $slug is not active; it stays stopped until campaign run."
+    return
+  fi
+  if ! $now; then
+    event stop-requested 'no new ticket starts; the runner stops when the running ones end'
+    note "Stopping $slug: no new ticket starts, and the runner stops when the running ones end (stop --now: at once)."
+    return
+  fi
+  { read -r pid <"$runtime/runner.pid"; } 2>/dev/null || pid=''
+  [[ $pid =~ ^[0-9]+$ ]] || die "the runner of $slug holds its lock but its pid is unknown"
+  stop_engine "$pid"
+  for _ in {1..50}; do runner_alive "$slug" || break; sleep 0.2; done
+  runner_alive "$slug" && die "the runner of $slug did not stop"
+  rm -f -- "$runtime/runner.pid" "$runtime"/state/*.active
+  event runner-stopped 'stopped at once on request; partial work stays in the ticket worktrees and the next run recovers it'
+  note "Stopped $slug at once; the next run recovers the interrupted tickets."
+}
+
+# campaign restart [--now] [run options]: stop, wait for the runner, then run with the last run's provider and workers
+# unless the options say otherwise.
+cmd_restart() {
+  assert_campaign_branch
+  local now=false provider='' workers='' slug runtime config attempt
+  local -a run_args=()
+  while (($#)); do
+    case $1 in
+      --now) now=true; shift ;;
+      --provider) (($# >= 2)) || die '--provider requires a value'; provider=$2; shift 2 ;;
+      --workers) (($# >= 2)) || die '--workers requires a value'; workers=$2; shift 2 ;;
+      *) die "unknown restart option: $1" ;;
+    esac
+  done
+  slug=$(campaign_slug); runtime=$(ensure_runtime "$slug"); config="$runtime/run-config.json"
+  [[ -n $provider || -f $config ]] || die "$slug never ran here: campaign run --provider NAME"
+  [[ -n $provider ]] || provider=$(jq -r '.provider' "$config")
+  [[ -n $workers ]] || workers=$(jq -r '.workers // 2' "$config" 2>/dev/null || printf '2')
+  if $now; then cmd_stop --now; else cmd_stop; fi
+  if runner_alive "$slug"; then
+    note "Waiting for the running tickets of $slug to end..."
+    while runner_alive "$slug"; do sleep "${AGENTIC_RESTART_POLL_SECONDS:-5}"; done
+  fi
+  # The last run's AGENTIC_* settings, unless this environment sets them.
+  local assignment variable
+  while IFS= read -r -d '' assignment; do
+    variable=${assignment%%=*}
+    [[ -n ${!variable+x} ]] || export "$assignment"
+  done < <(jq -j '.env // {} | to_entries[] | "\(.key)=\(.value)\u0000"' "$config" 2>/dev/null || true)
+  run_args=(--provider "$provider" --workers "$workers" --mode unattended)
+  cmd_run "${run_args[@]}"
+}
+
+cmd_watch() {
+  assert_campaign_branch
+  exec "$AGENTIC_DIR/bin/campaign-watch" --slug "$(campaign_slug)" "$@"
+}
+
+# The supervisor of this repository's campaigns on this machine: a systemd user service, installed and refreshed by
+# campaign run, that relaunches a campaign that should be running (after a technical pause, a crash or a reboot).
+supervisor_unit() { printf 'agentic-supervisor-%s.service\n' "$(repo_id)"; }
+
+ensure_supervisor() {
+  [[ ${AGENTIC_SUPERVISOR:-} != off && -z ${AGENTIC_SUPERVISED:-} ]] || return 0
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1 || return 0
+  local tree unit dir file snapshot content
+  tree=$(main_worktree); [[ -n $tree ]] || return 0
+  unit=$(supervisor_unit); dir="$(runtime_base)/supervisor"; file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit"
+  mkdir -p -- "$dir" "$(dirname -- "$file")"; chmod 700 "$dir"
+  snapshot=$(prepare_agentic_snapshot "$dir")
+  content="[Unit]
+Description=Stakhanov supervisor of the campaigns of $tree
+
+[Service]
+WorkingDirectory=$tree
+Environment=AGENTIC_CACHE=$(dirname -- "$(runtime_base)")
+ExecStart=$snapshot/bin/campaign _supervise
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target"
+  if [[ ! -f $file || $(<"$file") != "$content" ]]; then
+    printf '%s\n' "$content" >"$file"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  systemctl --user enable "$unit" >/dev/null 2>&1 || true
+  systemctl --user restart "$unit" >/dev/null 2>&1 || note "Warning: the supervisor $unit did not start"
+}
+
+supervise_loop() {
+  local file once=${1:-}
+  export AGENTIC_SUPERVISED=1 PATH="$PATH:$HOME/.local/bin"
+  while :; do
+    for file in "$(runtime_base)"/*/campaign.json; do
+      [[ -f $file ]] && { supervise_campaign "$file" || true; }
+    done
+    [[ $once != --once ]] || return 0
+    sleep "${AGENTIC_SUPERVISOR_POLL_SECONDS:-60}"
+  done
+}
+
+# One campaign: when it should run, has run before, and its runner is down, it is relaunched with its last settings after
+# the relaunch delay, three times at most without a ticket ending. Waiting on the coordinator, done, finalizing or in a
+# queue (the queue relaunches its own), it is left alone.
+supervise_campaign() {
+  local file=$1 runtime slug tree config status state done_now relaunches=0 done_before=0 since=0 now queue
+  runtime=$(dirname -- "$file"); slug=$(jq -r '.slug' "$file"); tree=$(jq -r '.worktree' "$file")
+  config="$runtime/run-config.json"; state="$runtime/state/supervisor"
+  [[ $(jq -r '.desired // "running"' "$file") == running && -f $config && -d $tree && ! -f $runtime/finalize.json ]] || return 0
+  if runner_alive "$slug"; then rm -f -- "$state"; return 0; fi
+  queue=$(jq -r '.queue // ""' "$config")
+  if [[ -n $queue && -f $(queue_dir "$queue")/pid ]] && kill -0 "$(<"$(queue_dir "$queue")/pid")" 2>/dev/null; then return 0; fi
+  status=$(cd "$tree" && "$AGENTIC_DIR/bin/campaign" status --json 2>/dev/null) || return 0
+  jq -e 'all(.tickets[]; .status == "done" or .required == false)' >/dev/null <<<"$status" && return 0
+  jq -e 'any(.tickets[]; .status == "blocked" or .status == "needs-human") or (.decisions | length > 0)' >/dev/null <<<"$status" && return 0
+  done_now=$(jq '[.tickets[] | select(.status == "done")] | length' <<<"$status")
+  now=$(date +%s)
+  [[ ! -f $state ]] || read -r relaunches done_before since <"$state" || true
+  if ((done_now > done_before)); then relaunches=0; done_before=$done_now; fi
+  ((since > 0)) || since=$now
+  printf '%s %s %s\n' "$relaunches" "$done_before" "$since" >"$state"
+  ((relaunches < 3)) || return 0
+  ((now - since >= ${AGENTIC_SUPERVISOR_DELAY_SECONDS:-300})) || return 0
+  relaunches=$((relaunches + 1))
+  printf '%s %s %s\n' "$relaunches" "$done_before" "$now" >"$state"
+  (cd "$tree" && REPO_ROOT=$tree && event supervisor-relaunch "the runner was down; relaunch $relaunches/3 with the last run's settings")
+  (
+    cd "$tree" || exit 1
+    while IFS= read -r -d '' assignment; do export "$assignment"; done < <(jq -j '.env // {} | to_entries[] | "\(.key)=\(.value)\u0000"' "$config")
+    exec "$AGENTIC_DIR/bin/campaign" run --provider "$(jq -r '.provider' "$config")" --workers "$(jq -r '.workers // 2' "$config")" \
+      --mode unattended
+  ) >>"$runtime/logs/supervisor.log" 2>&1 </dev/null || true
 }
 
 cmd_decide() {
@@ -1391,7 +1603,7 @@ queue_run_until_done() {
   while :; do
     if ! queue_runner_active "$tree"; then
       in_campaign_tree "$tree" status --json | jq -e 'all(.tickets[]; .status == "done" or .required == false)' >/dev/null && return 0
-      if ! in_campaign_tree "$tree" run --provider "$provider" --workers "$workers" --mode unattended >>"$dir/queue.log" 2>&1 9>&-; then
+      if ! AGENTIC_QUEUE=$name in_campaign_tree "$tree" run --provider "$provider" --workers "$workers" --mode unattended >>"$dir/queue.log" 2>&1 9>&-; then
         queue_status_write "$name" waiting "$slug: the runner refused to start (red baseline or provider preflight); retrying" "$slug"
         sleep "$(queue_relaunch_delay)"; continue
       fi
@@ -1591,10 +1803,42 @@ ticket_progress() {
          else {} end))'
 }
 
+# The fleet's functions (lib/fleet.sh, over the ssh transport of lib/remote.sh), loaded by the commands that use them.
+fleet_lib() {
+  # shellcheck source=../lib/remote.sh
+  source "$AGENTIC_DIR/lib/remote.sh"
+  # shellcheck source=../lib/fleet.sh
+  source "$AGENTIC_DIR/lib/fleet.sh"
+  # shellcheck source=../lib/move.sh
+  source "$AGENTIC_DIR/lib/move.sh"
+}
+
+# The human lines of an overview (an object with campaigns and queues).
+print_overview() {
+  if jq -e '(.campaigns | length) == 0 and (.queues | length) == 0 and ((.moved // []) | length) == 0' >/dev/null <<<"$1"; then
+    note 'No campaigns or queues in the cache.'
+    return
+  fi
+  jq -r '.campaigns[] | "Campaign \(.slug): runner \(if .runner_active then "active" else "inactive" end)\(if .desired == "stopped" then (if .runner_active then ", stopping" else ", stopped" end) else "" end) — \(.counts | to_entries | map("\(.key)=\(.value)") | join(" "))\(if (.recent_events | length) > 0 then (.recent_events[-1] | " · last event \(.local_time // .time): \(.type)\(if .ticket then " \(.ticket)" else "" end)") else "" end)"' <<<"$1"
+  jq -r '.queues[] | "Queue \(.name): \(.state) — \(.message)"' <<<"$1"
+  jq -r '(.moved // [])[] | "Campaign \(.slug): moved to \(.moved_to) (\(.at))"' <<<"$1"
+}
+
 # One view of every campaign and queue in the cache, for humans and for the campaign-status skill.
 cmd_overview() {
-  local json=false base file slug tree runtime tickets active active_ids decisions events campaigns='[]' queues
-  [[ ${1:-} == --json ]] && json=true
+  local json=false fleet=false arg base file slug tree runtime tickets active active_ids decisions events campaigns='[]' queues moved
+  for arg in "$@"; do
+    case $arg in
+      --json) json=true ;;
+      --fleet) fleet=true ;;
+      *) die "unknown overview option: $arg" ;;
+    esac
+  done
+  if $fleet; then
+    fleet_lib
+    fleet_overview "$json"
+    return
+  fi
   base=$(runtime_base)
   for file in "$base"/*/campaign.json; do
     [[ -f $file ]] || continue
@@ -1611,19 +1855,20 @@ cmd_overview() {
     events=$( (tail -n 10 "$runtime/events/campaign.ndjson" 2>/dev/null || true) | with_local_time)
     tickets=$(ticket_progress "$tickets" "$runtime/events/campaign.ndjson")
     campaigns=$(jq -c --arg slug "$slug" --arg tree "$tree" --argjson active "$active" --argjson tickets "$tickets" \
-      --argjson decisions "$decisions" --argjson events "$events" \
-      '. + [{slug:$slug, worktree:$tree, runner_active:$active,
+      --argjson decisions "$decisions" --argjson events "$events" --arg desired "$(jq -r '.desired // "running"' "$file")" \
+      '. + [{slug:$slug, worktree:$tree, runner_active:$active, desired:$desired,
              counts:($tickets | group_by(.status) | map({key:.[0].status, value:length}) | from_entries),
              tickets:$tickets, decisions:$decisions, recent_events:$events}]' <<<"$campaigns")
   done
   queues=$( (cat "$base"/queue/*/status.json 2>/dev/null || true) | jq -sc '.')
+  moved=$( (cat "$base"/moved/*.json 2>/dev/null || true) | jq -sc '.')
   if $json; then
-    jq -n --argjson campaigns "$campaigns" --argjson queues "$queues" '{campaigns:$campaigns, queues:$queues}'
+    jq -n --argjson campaigns "$campaigns" --argjson queues "$queues" --argjson moved "$moved" \
+      '{campaigns:$campaigns, queues:$queues, moved:$moved}'
     return
   fi
-  if [[ $campaigns == '[]' && $queues == '[]' ]]; then note 'No campaigns or queues in the cache.'; return; fi
-  jq -r '.[] | "Campaign \(.slug): runner \(if .runner_active then "active" else "inactive" end) — \(.counts | to_entries | map("\(.key)=\(.value)") | join(" "))\(if (.recent_events | length) > 0 then (.recent_events[-1] | " · last event \(.local_time // .time): \(.type)\(if .ticket then " \(.ticket)" else "" end)") else "" end)"' <<<"$campaigns"
-  jq -r '.[] | "Queue \(.name): \(.state) — \(.message)"' <<<"$queues"
+  print_overview "$(jq -cn --argjson campaigns "$campaigns" --argjson queues "$queues" --argjson moved "$moved" \
+    '{campaigns:$campaigns, queues:$queues, moved:$moved}')"
 }
 
 cmd_self_test() {
@@ -1634,6 +1879,27 @@ cmd_self_test() {
 }
 
 command=${1:-}; (($#)) && shift
+# --campaign SLUG [--on MACHINE]: the command acts on that campaign wherever it is in the fleet.
+case "$command" in
+  status | stop | run | restart | decide | recover | watch | move | finalize)
+    route_slug='' route_machine=''
+    route_args=()
+    while (($#)); do
+      case $1 in
+        --campaign) (($# >= 2)) || die '--campaign requires a slug'; route_slug=$2; shift 2 ;;
+        --on) (($# >= 2)) || die '--on requires a machine'; route_machine=$2; shift 2 ;;
+        *) route_args+=("$1"); shift ;;
+      esac
+    done
+    [[ -n $route_slug || -z $route_machine ]] || die '--on needs --campaign SLUG'
+    if [[ -n $route_slug ]]; then
+      fleet_lib
+      [[ $command != finalize ]] || finalize_here "$route_slug" "$route_machine" "${route_args[@]}"
+      route_campaign "$route_slug" "$route_machine" "$command" "${route_args[@]}"
+    fi
+    set -- "${route_args[@]}"
+    ;;
+esac
 case "$command" in
   init) cmd_init "$@" ;;
   current) cmd_current "$@" ;;
@@ -1641,6 +1907,11 @@ case "$command" in
   status) cmd_status "$@" ;;
   ready) cmd_ready "$@" ;;
   run) cmd_run "$@" ;;
+  stop) cmd_stop "$@" ;;
+  restart) cmd_restart "$@" ;;
+  move) fleet_lib; cmd_move "$@" ;;
+  _adopt) fleet_lib; cmd_adopt "$@" ;;
+  watch) cmd_watch "$@" ;;
   decide) cmd_decide "$@" ;;
   recover) cmd_recover "$@" ;;
   finalize) cmd_finalize "$@" ;;
@@ -1648,7 +1919,9 @@ case "$command" in
   self-test) cmd_self_test "$@" ;;
   queue) cmd_queue "$@" ;;
   overview) cmd_overview "$@" ;;
+  fleet) fleet_lib; cmd_fleet "$@" ;;
   _queue) queue_loop "$@" ;;
+  _supervise) supervise_loop "$@" ;;
   _engine) (($# == 2)) || die 'invalid engine invocation'; engine_loop "$1" "$2" ;;
   _verify-rebase) (($# == 4)) || die 'usage: _verify-rebase WORKTREE OLD_TIP OLD_BASE UPSTREAM'; verify_rebase_kept_changes "$@" ;;
   help|-h|--help|'') usage ;;

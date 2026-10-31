@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One remote executor (see "Remote executors" in .agentic/README.md), shared by lib/remote-run.sh (a worker-role
-# provider invocation) and bin/offload (a command). Sourced; it defines functions and variables and runs nothing.
+# provider invocation) and bin/offload (a command); lib/fleet.sh uses its ssh transport (remote_script). Sourced; it
+# defines functions and variables and runs nothing.
 #
 # executor_load JSON reads one normalized entry of the executors list (lib/common.sh). A local absolute path /x lives
 # at <root>/x on the executor host, and the executor's run prefix presents it at /x to what it runs; without run, root

@@ -1,10 +1,12 @@
 ---
 name: campaign-status
-description: Show the progress of every campaign and campaign queue (read-only board).
+description: Show the progress of every campaign and campaign queue of the project, on every machine of its fleet (read-only board).
 ---
 
-Run `.agentic/bin/campaign overview --json` from any worktree of the repository. It is read-only and
-lists every campaign in the runner cache and every campaign queue. Each ticket carries `goal`,
+Run `.agentic/bin/campaign overview --fleet --json` from any worktree of the repository. It is read-only
+(it only fetches the other machines' branches) and lists, for this machine and every other machine of the
+project's fleet (`machines`, this one first with `self`), every campaign in its runner cache and every
+campaign queue. Without a fleet it lists this machine alone. Each ticket carries `goal`,
 `depends_on`; in-progress tickets add `executor` (`local` or the remote executor running its workers), `started_local_time`, `elapsed_seconds`, `phase`,
 `phase_local_time`, `phase_seconds` and `unblocks` (todo tickets that depend on it, each with `goal`
 and `waits_also`: other unfinished dependencies); blocked/needs-human tickets add `reason`.
@@ -37,6 +39,11 @@ Phases of an in-progress ticket (`phase` → label → next step). Report the la
 | provider-error | ⚠️ provider error | recovery or runner pause |
 
 Any other value: show it as-is with ⚙️.
+
+With more than one machine, group by machine: a heading `🖥️ <name>` (`(this machine)` for `self`), then its
+campaigns and queues as below, or `No campaigns` when it has none. A machine with `reachable` false shows
+`📴 unreachable` with its `error` shortened, and its campaigns as last seen (`seen_local_time`, or `never seen`):
+say they may be out of date. With one machine, omit the machine heading.
 
 Layout per campaign:
 
@@ -74,5 +81,6 @@ Show every time in the display zone using `local_time` fields (`HH:MM (dd/mm)`; 
 `AGENTIC_DISPLAY_TZ`, then `timezone` in `.agentic/project.json`, then the system zone); never show the raw UTC
 `time`.
 
-End with what needs the user, if anything. Do not start, stop, recover or finalize anything from this
+End with what needs the user, if anything, including every entry of `warnings` (a main branch behind or
+diverged from another machine's: show its command; it is pulled by hand). Do not start, stop, recover or finalize anything from this
 skill.

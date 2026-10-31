@@ -153,7 +153,9 @@ class Repo:
         self.root = Path(self.temp.name)
         self.branch = branch
         self.installed = commit_kit
-        self.env = dict(os.environ, AGENTIC_CACHE=self.cache.name)
+        # A fleet file of the machine running the tests never reaches them, and no run installs a supervisor there.
+        self.env = dict(os.environ, AGENTIC_CACHE=self.cache.name, AGENTIC_FLEET=str(Path(self.cache.name) / "fleet.json"),
+                        AGENTIC_SUPERVISOR="off")
         self.env.pop("AGENTIC_DISPLAY_TZ", None)
         self.git("init", "-b", self.branch)
         self.git("config", "user.email", "agentic@example.test")

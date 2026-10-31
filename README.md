@@ -38,12 +38,13 @@ the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.m
 ## Requirements
 
 - Linux. macOS is not supported.
-- `bash`, `git`, `jq`, `python3`, `flock`, `setsid`, `curl`, `tar` and the usual coreutils. No ripgrep. The
+- `bash`, `git`, `jq`, `python3`, `flock`, `setsid`, `cmp` (diffutils), `curl`, `tar` and the usual coreutils. No ripgrep. The
   installer installs the missing ones (see below); with `--no-machine-setup` you provide them.
 - At least one provider CLI: `claude`, `codex` or `grok`. The installer installs it when it is missing.
-- Optional: a working user systemd, so the engine runs in the user's `background.slice`.
-- Optional: `ssh` and `rsync`, here and on the hosts, to run workers and commands on remote executors (`executors` in
-  `.agentic/project.json`).
+- Optional: a working user systemd, so the engine runs in the user's `background.slice` and a supervisor relaunches a
+  campaign that should be running after a crash or a reboot.
+- Optional: `ssh` and `rsync`, here and on the other machines, to use remote executors or a fleet (see
+  [Several machines](#several-machines)).
 
 ## Install
 
@@ -57,7 +58,7 @@ of a Git work tree.
 
 ### Machine setup (runs first)
 
-1. **System commands.** Any of `git`, `jq`, `python3`, `flock`, `setsid`, `curl` and `tar` that is missing (and
+1. **System commands.** Any of `git`, `jq`, `python3`, `flock`, `setsid`, `cmp`, `curl` and `tar` that is missing (and
    `npm`, only when a `codex` or `grok` CLI has to be installed) is installed through the package manager found
    (`pacman`, `apt-get`, `dnf` or `zypper`), with `sudo` unless you are root. The installer prints the exact
    command and asks `Install? [y/N]` (default no). With no supported package manager, or when you decline, it
@@ -111,7 +112,8 @@ The installer never commits. A Claude Code plugin install of Matt's skills names
 
 ### Then
 
-1. Edit `.agentic/project.json` if needed (required checks, time zone, archive folder, remote executors).
+1. Edit `.agentic/project.json` if needed (required checks, time zone, archive folder, remote executors). Its `name`
+   is how a fleet knows the project.
 2. Commit `.agentic`, the provider skills, `AGENTS.md` and `docs/agents/issue-tracker.md` on the main branch.
    Do this before `/to-spec`: `campaign init` refuses a main branch without the committed kit, because the
    campaign worktree and the engine come from the committed branch. The same goes for later edits of
@@ -127,22 +129,82 @@ The settings (`.agentic/project.json`) and every `AGENTIC_*` environment variabl
 `agentic/README.md`, installed as `.agentic/README.md`. The effective `project.json` is the main branch's
 committed copy.
 
-Remote executors: `executors` in `project.json` lists machines (reached over ssh) that run workers next to the local
-ones. The engine still does everything else here (worktrees, commits, validation, review, integration); each worker
-invocation syncs the ticket worktree there and back, and falls back to this machine when the host is unreachable, lacks
-a required command or has no room. `.agentic/bin/offload -- COMMAND` sends one command (a validation command, a heavy
-test suite) to an executor the same way, and runs it here when none can take it. `executor/` is the package that turns
-a Linux machine into an executor (`executor/install.sh root@host --config executor.conf`; see `executor/README.md`).
-
 Claude accounts: `AGENTIC_CLAUDE_ACCOUNTS=udarnik` (or any command with the same `account` subcommands) lets the Claude
 adapter run in the hook's current account and retry once in another one after a usage limit.
+
+## Controlling a campaign
+
+From the campaign's worktree (or from anywhere with `--campaign SLUG`, see below):
+
+```
+campaign status                  tickets, runner, desired state (running or stopped)
+campaign stop                    start no new ticket; the runner stops when the running ones end
+campaign stop --now              stop at once; the next run recovers the interrupted work
+campaign restart [--now]         stop, then run again with the last run's provider, workers and settings
+campaign watch                   wait until the campaign needs its coordinator (campaign-watch)
+```
+
+`campaign run` also installs a supervisor for the repository (a systemd user service): a campaign that should be
+running and whose runner went down (a crash, a technical pause, a reboot) is relaunched with its last settings, three
+times at most without progress; one waiting on a human decision, stopped, done or in a queue is left alone.
+
+## Several machines
+
+Two ways, which combine:
+
+- **Remote executors** run the workers (and heavy commands) of a campaign whose runner stays on this machine.
+  `executors` in `project.json` lists them; each worker invocation syncs the ticket worktree there and back, and falls
+  back to this machine when the host is unreachable or has no room. `.agentic/bin/offload -- COMMAND` sends one command
+  (a heavy test suite) the same way. `executor/` turns a Linux machine into an executor
+  (`executor/install.sh root@host --config executor.conf`; see `executor/README.md`).
+- **A fleet**: machines that each hold a clone of the project and run whole campaigns of their own. From any of them
+  you see and control every campaign of the project, a campaign moves from one to another with its uncommitted work,
+  and finalize lands it in the main branch of the machine where you run it. Nothing is central: each machine reaches
+  the others over ssh.
+
+### A fleet in practice
+
+```
+# In a clone of the project (its project.json "name" committed), on the machine you work on:
+.agentic/bin/campaign fleet join big-box --ssh me@10.0.0.22   # clone the project there and make it ready
+.agentic/bin/campaign fleet                                   # the machines, and how their main branches compare
+.agentic/bin/campaign overview --fleet                        # every campaign on every machine (/campaign-status)
+
+# A campaign prepared here (/to-spec, /to-tickets) runs on big-box:
+.agentic/bin/campaign move --to big-box --start               # in the campaign's worktree
+
+# From any machine of the fleet:
+.agentic/bin/campaign status  --campaign my-slug
+.agentic/bin/campaign stop    --campaign my-slug [--now]
+.agentic/bin/campaign restart --campaign my-slug
+.agentic/bin/campaign move    --campaign my-slug --to other-box
+
+# Land it in this machine's main branch (it is moved here first):
+.agentic/bin/campaign finalize --campaign my-slug
+```
+
+- **One file**, the same on every machine: `~/.config/agentic/fleet.json` (machines, their ssh destinations, where
+  each one keeps the project). `fleet join` and `fleet leave` write it everywhere.
+- **`fleet join` leaves the machine ready**: it installs the commands the kit needs and the project's provider CLIs,
+  signs them in (in a terminal), copies the project's local files and runs its setup when the fleet file says so,
+  checks that every machine reaches the others and that the user lingers. It ends with "every command works there" or
+  with the pending items, each with the command that solves it.
+- **Code moves through git**: each clone has the others as remotes named after their machines. No command ever moves
+  a main branch: a clone behind another one is warned, with the `git pull --ff-only <machine> <branch>` to run by hand.
+- **One machine holds a campaign at a time.** `campaign move` stops it there (after the running tickets, or at once
+  with `--now`), carries its branches, its uncommitted work and its history, and the other machine adopts it; the
+  first one keeps a tombstone. Commands with `--campaign` reach it wherever it is, with your `AGENTIC_*` settings.
+- **Trust**: every machine runs commands on the others as their user. Join only machines you trust.
+
+Every detail is in `agentic/README.md` ("Fleet", "Moving a campaign", "Stopping, restarting and supervision").
 
 ## Layout
 
 ```
 agentic/        engine, installed as <project>/.agentic/
   bin/          campaign (the supervisor), campaign-watch, offload (a command on an executor)
-  lib/          shared shell and Python helpers, remote.sh (one executor's steps), remote-run.sh (worker invocations)
+  lib/          shared shell and Python helpers, remote.sh (one executor's steps), remote-run.sh (worker invocations),
+                fleet.sh (the fleet), move.sh (moving a campaign between machines)
   providers/    claude, codex and grok adapters, RESULT parsing
   roles/        worker, reviewer and diagnostician prompts
   tests/        engine tests, run by `campaign self-test`
@@ -164,4 +226,5 @@ bash tests/install.sh                                          # the installer (
 bash executor/tests/executor.sh                                # the executor package (stubbed systemd, namespaces, ssh and claude; no root)
 ```
 
-The tests never call a real model: providers are mocks and every repository is temporary.
+The tests never call a real model: providers are mocks and every repository is temporary. The fleet tests run
+several machines on this one, each with its own home, machine id, cache and fleet file, behind a fake ssh.

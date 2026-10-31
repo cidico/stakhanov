@@ -16,8 +16,10 @@ three modes: `direct`, `ticket`, or `campaign`.
 - Read [`.agentic/TICKET.md`](.agentic/TICKET.md) when creating or changing campaign tickets.
 - Read [`.agentic/VALIDATION.md`](.agentic/VALIDATION.md) when defining executable campaign proof.
 - Run `/run-campaign` only from a canonical `campaign/<slug>` branch.
-- Run `/finalize-campaign` to validate, clean, and fast-forward a completed campaign.
-- Run `/campaign-status` for the board of every campaign and queue.
+- Run `/finalize-campaign` to validate, clean, and fast-forward a completed campaign into this machine's main branch.
+- Run `/campaign-status` for the board of every campaign and queue, on every machine of the project's fleet.
+- A campaign held by another machine of the fleet is driven from here with `.agentic/bin/campaign <command> --campaign
+  <slug>` (`.agentic/README.md`, "Fleet").
 
 ## Model delegation
 

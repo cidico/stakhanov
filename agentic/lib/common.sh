@@ -6,7 +6,7 @@ IFS=$'\n\t'
 
 die() { printf 'campaign: %s\n' "$*" >&2; exit 2; }
 require_command() { command -v "$1" >/dev/null 2>&1 || die "required command unavailable: $1"; }
-for command_name in git jq python3 flock setsid; do require_command "$command_name"; done
+for command_name in git jq python3 flock setsid cmp; do require_command "$command_name"; done
 unset command_name
 
 AGENTIC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -147,6 +147,19 @@ load_project_config() {
   if [[ -z ${AGENTIC_DISPLAY_TZ:-} && -n $PROJECT_TIMEZONE ]]; then export AGENTIC_DISPLAY_TZ=$PROJECT_TIMEZONE; fi
 }
 load_project_config
+# This machine's name in its fleet (see "Fleet" in README.md), or empty: the entry of fleet.json whose id is this
+# machine's id.
+fleet_self_name() {
+  local file=${AGENTIC_FLEET:-${XDG_CONFIG_HOME:-$HOME/.config}/agentic/fleet.json} id=${AGENTIC_MACHINE_ID:-}
+  [[ -f $file ]] || return 0
+  [[ -n $id ]] || id=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || true)
+  [[ -n $id ]] || return 0
+  jq -r --arg id "$id" 'first((.machines // {}) | to_entries[] | select(.value.id == $id) | .key) // ""' "$file" 2>/dev/null || true
+}
+# A machine of the fleet that is also one of the executors (same name) never sends work to itself.
+if [[ $PROJECT_EXECUTORS != '[]' ]]; then
+  PROJECT_EXECUTORS=$(jq -c --arg self "$(fleet_self_name)" 'map(select(.name != $self))' <<<"$PROJECT_EXECUTORS")
+fi
 # AGENTIC_EXECUTORS=local runs every worker on this machine, whatever the settings declare.
 case ${AGENTIC_EXECUTORS:-} in
   '') ;;
@@ -220,6 +233,18 @@ event() {
     --arg message "$message" --arg ticket "$ticket" \
     '{time:$time,type:$type,message:$message} + (if $ticket == "" then {} else {ticket:$ticket} end)' \
     >>"$runtime/events/campaign.ndjson"
+}
+
+# The desired state of a campaign ("desired" in its campaign.json): running, unless campaign stop said stopped.
+desired_state() {
+  jq -r '.desired // "running"' "$(runtime_dir "${1:-$(campaign_slug)}")/campaign.json" 2>/dev/null || printf 'running\n'
+}
+
+set_desired_state() {
+  local file
+  file="$(runtime_dir "$1")/campaign.json"
+  [[ -f $file ]] || return 0
+  jq --arg state "$2" '.desired = $state' "$file" >"$file.tmp" && chmod 600 "$file.tmp" && mv -f -- "$file.tmp" "$file"
 }
 
 runner_alive() {

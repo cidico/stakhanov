@@ -7,7 +7,9 @@ This invocation authorizes the runner's local rebase, fast-forward integration, 
 the inferred `campaign/<slug>` and `agentic/<slug>/*` namespaces. The runner creates only local branches and owns no remote refs; remote branches are
 therefore not cleanup targets. This invocation does not authorize a push or unrelated branch changes.
 
-Resolve and retain the worktree path for the main branch, then run `.agentic/bin/campaign finalize`. The
+Resolve and retain the worktree path for the main branch, then run `.agentic/bin/campaign finalize`. A campaign
+held by another machine of the project's fleet is finalized from here with `.agentic/bin/campaign finalize --campaign
+<slug>`: it is moved to this machine first, and lands in this machine's main branch. The
 runner must refuse before mutation unless every required
 ticket is `done`, no worker or runner is active, no required ticket is blocked or `needs-human`, and Git
 state is safe.

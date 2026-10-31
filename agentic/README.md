@@ -27,6 +27,8 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `archive_dir` | Where finalize archives the campaign history, relative to the main worktree, with `{date}` and `{slug}` placeholders; used only when Git ignores it. Default: the `archive/` folder of the cache. |
 | `executors` | Remote machines that run workers and offloaded commands; see [Remote executors](#remote-executors). Default: none, every role runs on this machine. |
 
+`name` is also how the machines of a [fleet](#fleet) know the project.
+
 ### Environment variables
 
 | Variable | Effect |
@@ -50,6 +52,10 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `AGENTIC_CLAUDE_ACCOUNTS` | Account hook command of the Claude adapter (for example `udarnik`); see `providers/claude/README.md`. Unset: claude runs in the caller's account. |
 | `AGENTIC_EXECUTORS` | `local` runs every worker on this machine whatever `executors` declares. Any other non-empty value is an error. |
 | `AGENTIC_SSH` | The ssh command for the executors (default `ssh`), also rsync's `-e` and git's transport. It is split on spaces, so it may carry options. |
+| `AGENTIC_SUPERVISOR` | `off` never installs the supervisor (tests, CI). |
+| `AGENTIC_SUPERVISOR_POLL_SECONDS`, `AGENTIC_SUPERVISOR_DELAY_SECONDS` | The supervisor's poll (default 60) and relaunch delay (default 300). |
+| `AGENTIC_FLEET` | The fleet file. Default `${XDG_CONFIG_HOME:-~/.config}/agentic/fleet.json`. |
+| `AGENTIC_MACHINE_ID` | This machine's id in the fleet, instead of `/etc/machine-id`. For tests. |
 | `AGENTIC_OFFLOAD`, `AGENTIC_EXECUTOR_RUN` | Set to `1`, `bin/offload` runs its command on this machine: it already is an offloaded command (`AGENTIC_OFFLOAD`, which `offload` sets) or an executor run (`AGENTIC_EXECUTOR_RUN`, which the executor package's run prefix sets). |
 
 The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters, `AGENTIC_UNITS` for an executor's `admit` and `run`, and
@@ -65,7 +71,7 @@ spec's first `# ` heading; there is no fallback to the file name, and `init` sto
 first), and `campaign queue start` refuses the same way. `.agentic/SPEC.md` has the spec contract and
 `.agentic/TICKET.md` the tickets; `campaign verify` checks both and the validation plan.
 
-Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid` and the usual coreutils (plus `ssh` and
+Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid`, `cmp` (diffutils) and the usual coreutils (plus `ssh` and
 `rsync` for remote executors). Linux only.
 
 ## Scheduling
@@ -260,6 +266,94 @@ and is the way a validation command, a worker or a person uses the executors' ca
 - The remote worktree is the one a remote worker of the same ticket uses, so the folders `exclude` keeps there (build
   output, dependencies) stay warm between runs. Run one offload per worktree at a time.
 
+## Fleet
+
+Machines that each hold a clone of the project and reach one another over ssh form a fleet: from any of them,
+`campaign overview --fleet` shows the campaigns of the project on all of them. Executors stay what they are (machines
+that run workers and commands for a runner elsewhere); a fleet machine runs its own campaigns.
+
+One file describes the fleet, the same on every machine: `${XDG_CONFIG_HOME:-~/.config}/agentic/fleet.json`
+(`AGENTIC_FLEET`). `fleet join` and `fleet leave` write it on every machine; there is nothing else to configure.
+
+```json
+{
+  "machines": {
+    "kepler":       {"ssh": "cidico@10.0.0.10", "id": "<machine id>"},
+    "edenred-arch": {"ssh": "edenred-arch",     "id": "<machine id>"}
+  },
+  "projects": {
+    "ShotlyPro": {"paths": {"kepler": "/home/cidico/Projects/shotly/webapp",
+                            "edenred-arch": "/home/shotlyrun/Projects/shotly/webapp"}}
+  }
+}
+```
+
+A machine finds its own entry by its machine id (`/etc/machine-id`). `ssh` is a destination every other machine
+reaches with a key and no prompt (`BatchMode`); an alias works where each machine's ssh configuration defines it. A
+project is the `name` of its committed `project.json`, and `paths` holds its clone on each machine. Every machine runs
+commands on the others as their user: the machines of a fleet trust one another. A project may also carry `files`
+(paths inside the clone that Git does not hold, such as local settings, copied from the joining machine's clone) and
+`setup` (an argv run in the new clone, for the project's own toolchain); `fleet join` writes neither, so add them to
+the file by hand.
+
+`campaign fleet join NAME --ssh DESTINATION [--path PATH] [--as NAME] [--as-ssh DESTINATION]`, from a clone of the
+project, adds the machine NAME:
+
+- it reaches DESTINATION and reads the machine's id and its fleet file (the two fleets become one; this machine's
+  entries win). The first join also enters this machine, as `--as` (default: its host name) reachable at `--as-ssh`
+  (default: `<user>@<the address NAME sees this machine at>`; a loopback address needs `--as-ssh`);
+- the clone goes at `--path`, by default the same place under NAME's home (the same path when this clone is outside
+  this home). A missing or empty folder gets a new clone: this machine's main branch pushed there and checked out, with
+  this clone's git identity when NAME has none. A clone of the project already there is left as it is; another
+  repository or another folder stops the join, before anything changes;
+- every machine gets the fleet file, and every clone of the project the other clones as git remotes named after their
+  machines (`<ssh>:<path>`, marked `remote.<name>.agentic-fleet`). A remote of that name that the fleet did not add is
+  left as it is;
+- before the clone, the commands the kit needs (`git`, `jq`, `python3`, `flock`, `setsid`, `cmp`, `rsync`) that NAME lacks are
+  installed with its package manager (`pacman`, `apt-get`, `dnf` or `zypper`), as root or through `sudo` without a
+  password; in a terminal, sudo may ask for its password. Without `git` the join stops;
+- the project's `files` are copied into the clone and its `setup` runs there;
+- NAME and every other machine must reach each other's clone with git over ssh (a host seen for the first time is
+  accepted, `StrictHostKeyChecking=accept-new`). When NAME cannot reach a machine, it gets an ssh key (when it has
+  none) and the pending item carries its public key, to authorize on that machine;
+- every provider the project runs campaigns with (the ones whose `run-campaign` skill it has) must be ready on NAME:
+  the adapter's `--ready` mode says whether its CLI is installed and signed in; a missing one is installed for that
+  user (`--install`: claude's official installer, or npm into `~/.local`); in a terminal, one that is not signed in
+  signs in there (`--login`, interactively); then the adapter's preflight must pass;
+- the user there must linger (`loginctl enable-linger`) when it has a systemd of its own, or a campaign's runner would
+  stop with the session that started it; the join turns it on when the user may, else it asks for sudo's password in a
+  terminal or leaves the command to run as root;
+- last, the campaign commands must run there (`campaign overview`).
+
+It runs again safely, and ends with "every command works there" or with the pending items (exit 3): a machine that does
+not answer, a command that could not be installed (with the command to run as root), a provider to sign in (with the
+command), a failed setup, a pair that cannot reach each other (with the key to authorize). Commands the fleet runs on a
+machine have the user's `~/.local/bin` at the end of their PATH.
+
+Code moves between the clones through git alone, and no command ever moves a main branch: a clone whose main branch is
+behind another machine's is warned with the command that pulls it, which the owner runs by hand
+(`git pull --ff-only <machine> <main branch>`). Campaign branches are fetched as `refs/remotes/<machine>/campaign/*`.
+
+- `campaign fleet [--json]` fetches the main and campaign branches of every other machine of the project and lists the
+  machines: this one, the reachable ones with how their main branch compares (`main_branch`: `only_there`,
+  `only_here`), the unreachable ones with the reason; then the warnings.
+- `campaign overview --fleet [--json]` adds every machine's `campaign overview` (its `campaigns` and `queues`). A
+  machine that does not answer shows the ones seen last (`seen_at`, `seen_local_time`), kept in `fleet-seen.json` of
+  the project's cache. Without a fleet it shows this machine alone.
+- `campaign init` refuses a slug that a campaign branch of another machine already has, and warns about a main branch
+  behind another machine's and about a machine that did not answer (the slug was not checked there).
+- `status`, `stop`, `run`, `restart`, `decide`, `recover`, `watch` and `move` take `--campaign SLUG [--on MACHINE]`
+  from any worktree of the project: on this machine when it holds the campaign, else on the machine of the fleet that
+  does (MACHINE when given, and several holders need it), in that campaign's worktree there, over ssh. The output and
+  the exit status are the command's there. The caller's `AGENTIC_*` settings travel with it (`AGENTIC_CLAUDE_MODEL=sonnet
+  campaign run --campaign SLUG ...`), except the ones that name this machine's paths or identity (`AGENTIC_CACHE`,
+  `AGENTIC_FLEET`, `AGENTIC_MACHINE_ID`, `AGENTIC_SSH`, `AGENTIC_PROVIDER_DIR`, `AGENTIC_SUPERVISOR`).
+  `finalize --campaign SLUG` brings the campaign here first (see
+  [Moving a campaign](#moving-a-campaign)).
+- A machine of the fleet that is also one of the project's `executors` (the same name) never sends work to itself.
+- `campaign fleet leave NAME` removes NAME: its fleet file and the fleet's remotes of its clones go, and every other
+  machine forgets it (file and remote). A machine that does not answer is listed as pending.
+
 ## Legacy campaign layout (accepted, not produced)
 
 Campaigns created before the kit keep running and finalizing; the kit never writes this layout.
@@ -268,6 +362,62 @@ Campaigns created before the kit keep running and finalizing; the kit never writ
   `Requirements`, `Constraints`, `Acceptance` and `Open questions`. Sections of the two layouts never combine to
   complete one. With the legacy sections, `Open questions` may also read `Nenhuma`.
 - A validation plan without `final` uses its plan-level `campaign_expensive` list as the final list.
+
+## Moving a campaign
+
+The machine that holds a campaign owns it: its runner, its worktrees, its branches `campaign/<slug>` and
+`agentic/<slug>/*` and its runtime. `campaign move --to MACHINE [--now] [--start | --no-start]`, in the campaign's
+worktree (or `--campaign SLUG` from any machine of the fleet), hands it to another machine of the project's fleet:
+
+1. MACHINE must hold a clone of the project whose kit can adopt a campaign (pull the main branch there first, by hand,
+   when it is older) and no campaign of that slug.
+2. Here the campaign stops: by default no new ticket starts and the move waits for the running ones to end; with `--now`
+   they stop at once. While it moves, neither `campaign run` nor the supervisor relaunches it.
+3. The uncommitted work of each of its worktrees (untracked files and deletions included, ignored files not) becomes a
+   commit under `refs/agentic/move/<slug>/`, without touching the branch or the index. Its branches and those commits
+   are pushed to MACHINE's clone, and its runtime (events, results, prompts, decisions, diagnoses, validation evidence,
+   `run-config.json`, the finalize checkpoint) is copied there; this machine's runner state, engine snapshot and
+   worktrees stay behind.
+4. MACHINE adopts it (`campaign _adopt`): its worktrees are made again under MACHINE's cache, each one's carried work
+   restored as uncommitted work, and its `campaign.json` records `epoch` (one more than here), `moved_from` and the
+   desired state it had here (event `campaign-moved`). The next run there treats an interrupted ticket as it would here
+   (`worker-interrupted`).
+5. Only then does this machine forget it: worktrees, branches and runtime go, and a tombstone stays in
+   `<cache>/moved/<slug>.json` (`campaign overview` lists it as moved). A failure before that leaves the campaign here,
+   as it was, and removes what MACHINE had received.
+6. It starts on MACHINE when it was running here and has run before, or with `--start`, with the last run's provider,
+   workers and travelling `AGENTIC_*` settings; `--no-start` never starts it.
+
+`campaign finalize --campaign SLUG [--on MACHINE]` finalizes a campaign into the main branch of the machine it is run
+on: a campaign held by another machine is first moved here (`move --to <this machine> --no-start`), then finalized as
+usual. The machine where finalize runs is the one whose main branch receives the campaign.
+
+## Stopping, restarting and supervision
+
+A campaign has a desired state, `desired` in its `campaign.json` (`running` or `stopped`): `campaign run` sets it to
+running and `campaign stop` to stopped. `campaign status` (`runner.desired` in `--json`) and `campaign overview` show it
+(`stopping` while a stopped campaign's runner still ends its running tickets).
+
+- `campaign stop` starts no new ticket; the runner stops by itself once the running tickets end (`runner-stopped`).
+  A `campaign run` before then cancels the stop (`stop-cancelled`) and the runner goes on.
+- `campaign stop --now` stops at once: TERM to the engine and everything it started (its whole systemd scope when it
+  runs in one, else its process tree), KILL after 10 seconds. The partial work stays in the ticket worktrees; the next
+  run treats it as an interrupted worker (`worker-interrupted`) and recovers it.
+- `campaign restart [--now] [--provider NAME] [--workers N]` stops (at once with `--now`, else after the running tickets
+  end), then runs again unattended with the last run's provider, workers and `AGENTIC_*` settings unless given (the
+  environment's own settings win).
+- `campaign watch [options]` is `campaign-watch --slug <this campaign>`.
+
+`campaign run` also installs and refreshes this repository's supervisor, a systemd user service
+(`agentic-supervisor-<repository id>.service`, from a snapshot of the main branch's `.agentic`) when the user has a
+systemd of its own; `AGENTIC_SUPERVISOR=off` skips it. Every `AGENTIC_SUPERVISOR_POLL_SECONDS` (60) it looks at the
+campaigns of the repository in the cache: one that should be running, has run before, is not finalizing, not done, not
+waiting on its coordinator (a blocked or needs-human ticket, a pending decision) and not part of a running queue, and
+whose runner is down (a crash, a reboot, a technical pause), is relaunched unattended with the last run's provider,
+workers and `AGENTIC_*` settings (kept in `run-config.json`), `AGENTIC_SUPERVISOR_DELAY_SECONDS` (300) after it was
+first seen down, three times at most without a ticket ending (`supervisor-relaunch`, its output in
+`logs/supervisor.log`). A user that does not linger loses the supervisor and the runners with its last session
+(`fleet join` checks it).
 
 ## Campaign queue
 
@@ -305,7 +455,8 @@ this marker and no `campaign/<slug>` branch as done and never initializes it aga
 The queue never pushes. Its state and log live in `<cache>/queue/<name>/`.
 
 `campaign overview [--json]` lists every campaign and queue in the cache (ticket counts, active runner,
-pending decisions, recent events); the `campaign-status` skill reports it.
+pending decisions, recent events); with `--fleet`, on every machine of the project's [fleet](#fleet). The
+`campaign-status` skill reports `overview --fleet`.
 
 ## Human decisions
 

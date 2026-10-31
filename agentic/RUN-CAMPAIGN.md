@@ -88,9 +88,13 @@ to see every campaign and queue at once.
 
 - The engine runs from a snapshot of the main branch's committed `.agentic`. Commit runner, adapter or
   config changes on the main branch, then `campaign run` again; uncommitted edits never reach an engine.
-- Restarting the engine is safe at any phase: kill the engine's whole process tree, then `campaign run`. A ticket
-  that was `implementing` has uncommitted partial work; the runner emits `worker-interrupted` and starts a
+- Restarting the engine is safe at any phase: `campaign restart --now` (or `campaign stop --now`, then `campaign run`).
+  A ticket that was `implementing` has uncommitted partial work; the runner emits `worker-interrupted` and starts a
   recovery worker on it instead of validating it as complete, so the interrupted ticket is recovered by itself.
+  `campaign stop` without `--now` starts no new ticket and lets the running ones end. A campaign that should be running
+  is relaunched by the supervisor after a crash or a reboot; one that was stopped stays stopped.
+- A campaign on another machine of the fleet is coordinated from here with `--campaign SLUG` on `status`, `stop`, `run`,
+  `restart`, `decide`, `recover` and `watch` (`.agentic/README.md`, "Fleet"); code fixes are made in its worktree there.
 - A ticket that legitimately changes an instruction file is rejected with "worker edited coordinator-owned
   instructions". Review the change, remove it from the ticket worktree, commit only that file as coordinator
   on the campaign branch, then `campaign recover <id>` and `campaign run`. Do not ask the human for this.
