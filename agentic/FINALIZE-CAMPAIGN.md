@@ -24,6 +24,16 @@ Finalization performs this sequence:
    (`finalize.json`) records the commit it validated (`tip`); a campaign branch anywhere else when finalize
    resumes (a manual rebase after a conflict, a new commit, a checkpoint without `tip`) is validated again
    before anything is merged.
+   A command that already passed on the same commit is not run again. The receipt of the final validation
+   (`<runtime>/validation/campaign.final.json`) records the commit it validated (`tip`) and is saved after every
+   command, so a run that failed, or was killed, keeps what passed. The next run takes the passed commands of that
+   receipt when the branch is at the same commit and no tracked file has changed, says so
+   (`campaign final: reusing the PASS of ...`), and runs the others. Any other commit (a repair, a corrected plan, a
+   rebase onto a main branch that moved) validates everything again.
+   While the final validation runs, finalize keeps the marker `<cache>/finalizing/<slug>.json` and sets
+   `AGENTIC_FINALIZE=<slug>` for the validation commands. `.agentic/bin/campaign finalizing` lists the finalizes that
+   are validating on this machine (exit status 0, or 1 when there is none), so a project's heavy tools can leave the
+   machine to them; a command that finalize itself runs never waits for it.
    To correct the plan after a failed final validation, commit the corrected `campaigns/<slug>/validation.json` on
    the campaign branch and run finalize again. It takes the committed plan, checks it again (ticket keys and the
    project's `required_checks`) and re-validates before anything is merged.

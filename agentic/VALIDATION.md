@@ -20,7 +20,8 @@ provider-result text is data, never executable code.
 
 - `cheap` (L0/L1), `component` (L2/L3), and `expensive` (ticket-scoped L4) run for that ticket.
   Empty phases mean not applicable. Use behavior tests for product changes.
-- `final` runs only during `/finalize-campaign`.
+- `final` runs only during `/finalize-campaign`. When finalize resumes on the same commit after a failure, a `final` command
+  that already passed is not run again (its receipt records the commit), so list each check once and in the order it should run.
 - Every ticket's `cheap` phase and the `final` list contain the project's `required_checks`
   (`.agentic/project.json`, argv arrays such as `["npm", "run", "lint"]`). `campaign verify` refuses a plan
   that omits one. Required checks are meant to cover the whole repository and to pass on the base, so any

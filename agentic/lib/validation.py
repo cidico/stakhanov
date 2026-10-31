@@ -16,12 +16,13 @@ SECRET_REPLACE = re.compile(
     r"(postgres(?:ql)?://)[^\s@]+@"
 )
 
-def save(path, value):
+def save(path, value, rotate=False):
+    """Writes the receipt atomically; rotate keeps the one it replaces as <receipt>.previous."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temp = tempfile.mkstemp(dir=path.parent)
     with os.fdopen(fd, 'w') as stream:
         json.dump(value, stream)
-    if value.get('status') == 'RUNNING' and path.exists():
+    if rotate and path.exists():
         os.replace(path, path.with_suffix(path.suffix + '.previous'))
     os.replace(temp, path)
 
@@ -158,6 +159,63 @@ def command_record(command, exit_code, started, finished, stdout, stderr, stdout
         'failedTests': tests,
         'tail': tail,
     }
+
+
+def git_text(tree, *args):
+    """Output of a git command in the tree, or None when it fails."""
+    result = subprocess.run(['git', '-C', str(tree), *args], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    return result.stdout if result.returncode == 0 else None
+
+
+def tree_state(tree):
+    """(commit, dirty): HEAD of the tree, and whether it has tracked changes (or could not be read)."""
+    tip = (git_text(tree, 'rev-parse', 'HEAD') or '').strip() or None
+    status = git_text(tree, 'status', '--porcelain', '--untracked-files=no')
+    return tip, status is None or bool(status.strip())
+
+
+def reusable_evidence(path, tip, dirty):
+    """The passed commands of the receipt at path, when they ran on this very commit and tree: the same tip, no tracked
+    change now and none then. Any status counts: a failed or killed run keeps what passed."""
+    if not tip or dirty:
+        return []
+    try:
+        old = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(old, dict) or old.get('tip') != tip or old.get('dirty') or not isinstance(old.get('evidence'), list):
+        return []
+    return [record for record in old['evidence']
+            if isinstance(record, dict) and record.get('exitCode') == 0 and isinstance(record.get('command'), list)]
+
+
+def take_reusable(available, command):
+    """Removes from available and returns the passed record of command (in the form records store it), else None."""
+    wanted = [sanitize_text(part) for part in command]
+    for position, record in enumerate(available):
+        if record['command'] == wanted:
+            return available.pop(position)
+    return None
+
+
+class Receipt:
+    """The receipt of one run. Its first write keeps the receipt it replaces as .previous; the later ones do not."""
+    def __init__(self, path, manifest, tip=None, dirty=False):
+        self.path, self.manifest, self.tip, self.dirty, self.written = path, manifest, tip, dirty, False
+
+    def write(self, status, evidence, **extra):
+        value = {'status': status, 'manifest': str(self.manifest)}
+        if self.tip is not None or self.dirty:
+            value['tip'] = self.tip
+            if self.dirty:
+                value['dirty'] = True
+        value['evidence'] = evidence
+        value.update(extra)
+        save(self.path, value, rotate=not self.written)
+        self.written = True
+
+
 class CommandFailed(ValueError):
     def __init__(self, record):
         super().__init__(f"validation command failed (exit {record['exitCode']})")
@@ -204,23 +262,42 @@ def run(args):
     if not selected:
         save(receipt, {'status': 'NOT_REQUIRED', 'manifest': str(manifest)})
         return
-    save(receipt, {'status': 'RUNNING', 'manifest': str(manifest)})
+    # The final validation is the only long one: it records the commit it validates, saves what passed after every
+    # command, and does not run again a command that already passed on this commit and tree.
+    final = args.phase == 'final'
+    tip, dirty, available = None, False, []
+    if final:
+        tip, dirty = tree_state(tree)
+        available = reusable_evidence(receipt, tip, dirty)
+    proof = Receipt(receipt, manifest, tip, dirty)
     evidence = []
+    reused = 0
     command = None
     try:
         for index, command in enumerate(selected):
+            old = take_reusable(available, command)
+            if old:
+                evidence.append(dict(old, reused=True))
+                reused += 1
+                print(f'{args.ticket} {args.phase}: reusing the PASS of {" ".join(old["command"])[:100]} '
+                      f'from {old.get("startedAt")} (same commit {tip[:9]})', flush=True)
+                continue
+            if not proof.written:
+                proof.write('RUNNING', evidence)
             record = execute(command, tree, logs_dir=args.runtime / 'logs',
                              log_stem=f'{args.ticket}.{args.phase}.{index}')
             evidence.append(record)
+            if final:
+                proof.write('RUNNING', evidence)
     except CommandFailed as exc:
         evidence.append(exc.record)
-        save(receipt, {'status': 'FAIL', 'manifest': str(manifest), 'evidence': evidence, 'reason': str(exc), 'failed_command': exc.record['command']})
+        proof.write('FAIL', evidence, reason=str(exc), failed_command=exc.record['command'])
         raise
     except OSError as exc:
-        save(receipt, {'status': 'FAIL', 'manifest': str(manifest), 'evidence': evidence, 'reason': str(exc), 'failed_command': command})
+        proof.write('FAIL', evidence, reason=str(exc), failed_command=command)
         raise
-    save(receipt, {'status': 'PASS', 'manifest': str(manifest), 'evidence': evidence})
-    print(f'{args.ticket} {args.phase}: PASS ({len(evidence)} commands)')
+    proof.write('PASS', evidence)
+    print(f'{args.ticket} {args.phase}: PASS ({len(evidence)} commands{f", {reused} reused" if reused else ""})')
 
 
 def main():

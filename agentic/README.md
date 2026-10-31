@@ -59,9 +59,10 @@ find `main_branch`, and is the fallback while the main branch has no committed c
 | `AGENTIC_MACHINE_ID` | This machine's id in the fleet, instead of `/etc/machine-id`. For tests. |
 | `AGENTIC_OFFLOAD`, `AGENTIC_EXECUTOR_RUN` | Set to `1`, `bin/offload` runs its command on this machine: it already is an offloaded command (`AGENTIC_OFFLOAD`, which `offload` sets) or an executor run (`AGENTIC_EXECUTOR_RUN`, which the executor package's run prefix sets). |
 
-The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters, `AGENTIC_UNITS` for an executor's `admit` and `run`, and
+The runner sets `AGENTIC_CAMPAIGN_ROOT` for the adapters, `AGENTIC_UNITS` for an executor's `admit` and `run`,
 `AGENTIC_RUN_KIND` (`worker` or `offload`) for its `admit` (see
-[Remote executors](#remote-executors)); they are not settings.
+[Remote executors](#remote-executors)), and `AGENTIC_FINALIZE` (the campaign's slug) for the commands of a final
+validation (see [Final validation](#final-validation)); they are not settings.
 
 ## Starting a campaign
 
@@ -162,6 +163,31 @@ Required commands: `bash`, `git`, `jq`, `python3`, `flock`, `setsid`, `cmp` (dif
 - `campaign run`, `campaign finalize` and `campaign queue start` drop to the lowest CPU priority (nice 19), and the
   detached engine and queue run in the user's `background.slice` (`agentic-<kind>-<slug>-<pid>.scope`), so tests
   only take the CPU the rest of the machine leaves free. Without a working user systemd (CI) only the priority applies.
+
+## Final validation
+
+`campaign finalize` runs the plan's `final` commands once, on the rebased tree that the main branch will fast-forward
+to (`.agentic/FINALIZE-CAMPAIGN.md` has the whole sequence). Its receipt, `<runtime>/validation/campaign.final.json`,
+records the commit it validated (`tip`).
+
+- The receipt is saved after every command (status `RUNNING` until the last one, then `PASS` or `FAIL`), and the receipt it
+  replaces is kept as `campaign.final.json.previous` by the first save of a run only.
+- A command that passed is not run again when finalize resumes on the same commit: the run takes the passed records
+  of the existing receipt (any status, a killed run included), marks them `"reused": true` with their original times,
+  prints `campaign final: reusing the PASS of <command> from <time> (same commit <sha>)` and runs the others. The
+  final line counts them: `campaign final: PASS (6 commands, 3 reused)`. Nothing is reused when the branch is at
+  another commit, when a tracked file has changed (now, or when the evidence was recorded), or when the receipt has no
+  `tip`. Ticket phases and the baseline never reuse anything.
+- While the final validation runs, finalize keeps the machine-local marker `<cache>/finalizing/<slug>.json` (`slug`,
+  `pid`, `startedAt`, `tree`; mode 600), removed when the validation ends and when finalize exits. A finalize that is
+  killed outright (SIGKILL, SIGTERM) leaves it behind, and the next reader removes it as stale. The validation commands
+  run with `AGENTIC_FINALIZE=<slug>`, so a project's own scripts know they are the finalize's commands and must never
+  wait for it.
+- `campaign finalizing` (machine-local: no campaign branch, any worktree of the project, never routed to another
+  machine) prints one line per finalize validating on this machine, `<slug> since <time> (pid <pid>)`, with the time
+  in the display zone, and exits 0; with none it prints nothing and exits 1. It removes the markers of finalizes that
+  are gone (a dead pid, or a pid that is no longer a `campaign` process). It takes no option but `--help`. Project
+  tools use it to stay away from the machine while a final validation runs.
 
 ## Remote executors
 

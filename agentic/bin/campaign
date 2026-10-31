@@ -27,6 +27,7 @@ Commands:
   decide TICKET DECISION          Resolve a pending retry/block/cancel decision
   recover TICKET                 Reuse existing delta for validation and fresh review
   finalize                        Gate, clean, rebase and FF-only merge into the main branch
+  finalizing                      List the finalizes validating on this machine (exit 0), or none (exit 1)
   cleanup [--ticket ID]           Remove runner-owned completed/stale resources
   self-test                       Run deterministic harness tests with mock providers
   queue start FILE [--foreground] Run campaigns in sequence (init → run → finalize), resumable
@@ -1435,9 +1436,60 @@ refresh_validation_manifest() {
   event finalize-plan-refreshed "the validation plan changed on the campaign branch; the final proof uses the new plan"
 }
 
+# Machine-local marker of a finalize that is validating: <cache>/finalizing/<slug>.json (slug, pid, startedAt, tree). It
+# lives outside the campaign's runtime, which finalize removes at its end, and exists only while the final validation
+# runs. `campaign finalizing` lists the live ones, so a project's heavy tools can leave the machine to the validation.
+finalizing_dir() { printf '%s/finalizing\n' "$(runtime_base)"; }
+finalizing_file() { printf '%s/%s.json\n' "$(finalizing_dir)" "$1"; }
+
+# finalizing_begin SLUG TREE: writes the marker, and removes it again when this process exits for any reason (a die, a
+# signal), after the EXIT trap already set, if any.
+finalizing_begin() {
+  local slug=$1 tree=$2 file previous
+  file=$(finalizing_file "$slug")
+  mkdir -p -- "$(finalizing_dir)"
+  chmod 700 "$(finalizing_dir)"
+  jq -cn --arg slug "$slug" --argjson pid "$$" --arg startedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg tree "$tree" \
+    '{slug:$slug,pid:$pid,startedAt:$startedAt,tree:$tree}' >"$file.tmp"
+  chmod 600 "$file.tmp"; mv -f -- "$file.tmp" "$file"
+  previous=$(trap -p EXIT)
+  if [[ -n $previous ]]; then eval "set -- $previous"; previous=$3; fi
+  trap "${previous:+$previous; }rm -f -- $(printf '%q' "$file") $(printf '%q' "$file.tmp")" EXIT
+}
+
+finalizing_end() { rm -f -- "$(finalizing_file "$1")"; }
+
+cmd_finalizing() {
+  case ${1:-} in
+    '') ;;
+    -h | --help)
+      note 'Usage: campaign finalizing'
+      note 'One line per finalize validating on this machine: <slug> since <time> (pid <pid>). Exit status 0 when there is'
+      note 'at least one, 1 when none. A marker left by a finalize that is gone is removed.'
+      return 0 ;;
+    *) die "unknown finalizing option: $1 (only --help)" ;;
+  esac
+  (($# == 0)) || die 'finalizing takes no arguments'
+  local file pid slug started live=false
+  for file in "$(finalizing_dir)"/*.json; do
+    [[ -f $file ]] || continue
+    pid=$(jq -r '.pid // ""' "$file" 2>/dev/null) || pid=''
+    # Alive, and still a campaign process: a reused pid is not this finalize.
+    if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && [[ $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) == *campaign* ]]; then
+      slug=$(jq -r '.slug // ""' "$file"); started=$(jq -r '.startedAt // ""' "$file")
+      printf '%s since %s (pid %s)\n' "${slug:-$(basename -- "$file" .json)}" \
+        "$(in_display_tz date -d "$started" '+%H:%M (%d/%m)' 2>/dev/null || printf '%s' "$started")" "$pid"
+      live=true
+    else
+      rm -f -- "$file"
+    fi
+  done
+  $live
+}
+
 cmd_finalize() {
   assert_campaign_branch
-  local slug runtime tickets campaign_branch campaign_tree main_tree branch dirty manifest_copy same_tree=false state_file stage snapshot recorded
+  local slug runtime tickets campaign_branch campaign_tree main_tree branch dirty manifest_copy same_tree=false state_file stage snapshot recorded validated
   yield_cpu
   slug=$(campaign_slug); runtime=$(ensure_runtime "$slug"); campaign_branch="campaign/$slug"; campaign_tree=$REPO_ROOT
   exec 6>"$runtime/launcher.lock"
@@ -1510,7 +1562,13 @@ cmd_finalize() {
   if [[ $stage == rebased ]]; then
     refresh_validation_manifest "$slug" "$campaign_tree" "$manifest_copy" || true
     verify_plan "$manifest_copy" "$tickets"
-    if ! run_final_validation "$campaign_tree" "$manifest_copy"; then
+    # The marker tells this machine's other tools that a final validation is running; AGENTIC_FINALIZE tells the
+    # validation's own commands that they are that validation, and must never wait for it.
+    validated=true
+    finalizing_begin "$slug" "$campaign_tree"
+    AGENTIC_FINALIZE=$slug run_final_validation "$campaign_tree" "$manifest_copy" || validated=false
+    finalizing_end "$slug"
+    if ! $validated; then
       die 'final validation failed; preserve evidence, repair the cause, then resume finalize'
     fi
     jq -cn --arg tip "$(git -C "$campaign_tree" rev-parse HEAD)" '{stage:"proved",tip:$tip}' >"$state_file"
@@ -1973,6 +2031,7 @@ case "$command" in
   decide) cmd_decide "$@" ;;
   recover) cmd_recover "$@" ;;
   finalize) cmd_finalize "$@" ;;
+  finalizing) cmd_finalizing "$@" ;;
   cleanup) cmd_cleanup "$@" ;;
   self-test) cmd_self_test "$@" ;;
   queue) cmd_queue "$@" ;;
