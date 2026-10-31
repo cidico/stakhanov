@@ -156,6 +156,26 @@ fleet_self_name() {
   [[ -n $id ]] || return 0
   jq -r --arg id "$id" 'first((.machines // {}) | to_entries[] | select(.value.id == $id) | .key) // ""' "$file" 2>/dev/null || true
 }
+# Where a campaign is and how to open it (campaign status, overview, run and move print it).
+# shell_word WORD: WORD as one shell word a person can paste: as it is when plain, single-quoted otherwise.
+shell_word() {
+  if [[ $1 =~ ^[A-Za-z0-9_./:@%+=,-]+$ ]]; then printf '%s' "$1"; else printf "'%s'" "${1//\'/\'\\\'\'}"; fi
+}
+# This machine's name: its name in the fleet, else its host name.
+machine_name() {
+  local name
+  name=$(fleet_self_name)
+  [[ -n $name ]] || name=$(uname -n | cut -d. -f1)
+  printf '%s\n' "$name"
+}
+# open_command TREE PROVIDER [VIA]: the command that opens PROVIDER's CLI in the campaign worktree TREE. VIA (default
+# AGENTIC_OPEN_VIA, which a command routed from another machine of the fleet carries: `ssh -t <this machine>`) runs it
+# from where the person asked.
+open_command() {
+  local inner via=${3-${AGENTIC_OPEN_VIA:-}}
+  inner="cd $(shell_word "$1") && ${2:-claude}"
+  if [[ -n $via ]]; then printf '%s %s\n' "$via" "$(shell_word "$inner")"; else printf '%s\n' "$inner"; fi
+}
 # A machine of the fleet that is also one of the executors (same name) never sends work to itself.
 if [[ $PROJECT_EXECUTORS != '[]' ]]; then
   PROJECT_EXECUTORS=$(jq -c --arg self "$(fleet_self_name)" 'map(select(.name != $self))' <<<"$PROJECT_EXECUTORS")

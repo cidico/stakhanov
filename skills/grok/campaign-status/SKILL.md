@@ -13,7 +13,8 @@ machine (name, `this machine` for `self`); a machine with `reachable` false is m
 shortened, and its campaigns are the ones last seen (`seen_local_time`, or never seen), possibly out of date:
 
 - Per campaign: `done/total` tickets, tickets in progress (with their `executor` when it is not `local`), runner
-  active or inactive.
+  active or inactive, its `machine` and `worktree`, and the command that opens it, `open`, verbatim in a code span
+  (from another machine it already starts with the ssh to that machine).
 - Every `blocked` or `needs-human` ticket with its reason in one line (from the latest `ticket-blocked`,
   `ticket-needs-human`, `integration-conflict` or `base-red` event), and every pending decision with its
   options.

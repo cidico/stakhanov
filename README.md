@@ -137,7 +137,8 @@ adapter run in the hook's current account and retry once in another one after a 
 From the campaign's worktree (or from anywhere with `--campaign SLUG`, see below):
 
 ```
-campaign status                  tickets, runner, desired state (running or stopped)
+campaign status                  tickets, runner, desired state, and where it is: machine, project, worktree
+                                 and the command that opens the provider's CLI in it
 campaign stop                    start no new ticket; the runner stops when the running ones end
 campaign stop --now              stop at once; the next run recovers the interrupted work
 campaign restart [--now]         stop, then run again with the last run's provider, workers and settings

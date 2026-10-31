@@ -345,7 +345,9 @@ behind another machine's is warned with the command that pulls it, which the own
 - `status`, `stop`, `run`, `restart`, `decide`, `recover`, `watch` and `move` take `--campaign SLUG [--on MACHINE]`
   from any worktree of the project: on this machine when it holds the campaign, else on the machine of the fleet that
   does (MACHINE when given, and several holders need it), in that campaign's worktree there, over ssh. The output and
-  the exit status are the command's there. The caller's `AGENTIC_*` settings travel with it (`AGENTIC_CLAUDE_MODEL=sonnet
+  the exit status are the command's there. It runs with the kit of that machine's main clone, so a campaign created by
+  an older kit is driven by the one its machine's main branch holds now (pulled there by hand). The caller's
+  `AGENTIC_*` settings travel with it (`AGENTIC_CLAUDE_MODEL=sonnet
   campaign run --campaign SLUG ...`), except the ones that name this machine's paths or identity (`AGENTIC_CACHE`,
   `AGENTIC_FLEET`, `AGENTIC_MACHINE_ID`, `AGENTIC_SSH`, `AGENTIC_PROVIDER_DIR`, `AGENTIC_SUPERVISOR`).
   `finalize --campaign SLUG` brings the campaign here first (see
@@ -393,6 +395,12 @@ on: a campaign held by another machine is first moved here (`move --to <this mac
 usual. The machine where finalize runs is the one whose main branch receives the campaign.
 
 ## Stopping, restarting and supervision
+
+`campaign status` also says where the campaign is (`location` in `--json`): the machine, the project's main clone, the
+campaign's worktree and the command that opens its provider's CLI there (`cd <worktree> && claude`). From another machine
+of the fleet that command starts with the ssh to the campaign's machine (`ssh -t <machine> 'cd <worktree> && claude'`).
+`campaign overview` gives the same for every campaign (`machine`, `project`, `worktree`, `provider`, `open`), and
+`campaign run` and `campaign move` print it when they start or hand over a campaign.
 
 A campaign has a desired state, `desired` in its `campaign.json` (`running` or `stopped`): `campaign run` sets it to
 running and `campaign stop` to stopped. `campaign status` (`runner.desired` in `--json`) and `campaign overview` show it

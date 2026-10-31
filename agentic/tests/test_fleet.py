@@ -316,6 +316,22 @@ class FleetTests(unittest.TestCase):
         status = json.loads(self.on("box", "status", "--campaign", "harness-sample", "--json").stdout)
         self.assertEqual(status["campaign"], "harness-sample")
 
+    def test_another_machines_campaign_opens_through_the_ssh_to_it(self):
+        self.join()
+        self.init_on("box", "remote-one")
+        tree = next(Path(self.envs["box"]["AGENTIC_CACHE"]).rglob("remote-one/worktrees/campaign"))
+        status = json.loads(self.repo.command("status", "--campaign", "remote-one", "--json").stdout)
+        self.assertEqual(status["location"]["open"], f"ssh -t box 'cd {tree} && claude'")
+        self.assertEqual((status["location"]["machine"], status["location"]["project"]), ("box", str(self.clone("box"))))
+        report = json.loads(self.repo.command("overview", "--fleet", "--json").stdout)
+        box = next(machine for machine in report["machines"] if machine["name"] == "box")
+        self.assertEqual(box["campaigns"][0]["open"], f"ssh -t box 'cd {tree} && claude'")
+        self.assertIn(f"open: ssh -t box 'cd {tree} && claude'", self.repo.command("overview", "--fleet").stdout)
+        # A campaign worktree holding an older kit is still driven, by the kit of box's main clone.
+        (tree / ".agentic" / "bin" / "campaign").write_text("#!/bin/sh\necho old kit >&2\nexit 1\n")
+        status = json.loads(self.repo.command("status", "--campaign", "remote-one", "--json").stdout)
+        self.assertEqual(status["campaign"], "remote-one")
+
     def test_a_routed_command_says_where_the_campaign_is_not(self):
         self.join()
         result = self.repo.command("status", "--campaign", "nowhere", check=False)
@@ -355,6 +371,7 @@ class FleetTests(unittest.TestCase):
         result = self.repo.command("move", "--to", "box", "--no-start", cwd=self.repo.worktree)
         self.assertIn("Carrying the uncommitted work of TST-001", result.stdout)
         self.assertIn("Campaign harness-sample moved to box", result.stdout)
+        self.assertIn("Open it there: ssh -t box 'cd ", result.stdout)
         # Here: a tombstone, nothing else.
         self.assertEqual(self.git(self.root, "branch", "--list", "campaign/*", "agentic/*"), "")
         self.assertEqual(self.git(self.root, "for-each-ref", "refs/agentic/"), "")

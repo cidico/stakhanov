@@ -116,6 +116,23 @@ class ControlTests(unittest.TestCase):
         self.assertEqual((config["provider"], config["workers"]), ("mock", 1))
         self.assertEqual(config["env"]["AGENTIC_CLAUDE_EFFORT"], "low")
 
+    def test_status_overview_and_run_say_where_the_campaign_is_and_how_to_open_it(self):
+        self.repo.configure([ticket()])
+        tree = str(self.repo.worktree)
+        location = self.status()["location"]
+        self.assertEqual((location["worktree"], location["project"]), (tree, str(self.repo.root)))
+        self.assertEqual(location["open"], f"cd {tree} && claude")
+        self.assertTrue(location["machine"])
+        text = self.repo.command("status", cwd=self.repo.worktree).stdout
+        self.assertIn(f"Worktree: {tree}", text)
+        self.assertIn(f"Open: cd {tree} && claude", text)
+        self.repo.mock_provider()
+        result = self.run_campaign()
+        self.assertIn(f"Open: cd {tree} && mock", result.stdout)
+        overview = json.loads(self.repo.command("overview", "--json").stdout)["campaigns"][0]
+        self.assertEqual((overview["worktree"], overview["project"], overview["open"]), (tree, str(self.repo.root), f"cd {tree} && mock"))
+        self.assertIn(f"  open: cd {tree} && mock", self.repo.command("overview").stdout)
+
     def test_restart_needs_a_previous_run_or_a_provider(self):
         self.repo.configure([ticket()])
         result = self.repo.command("restart", cwd=self.repo.worktree, check=False)

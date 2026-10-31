@@ -210,15 +210,18 @@ shift
 exec "$@"
 SCRIPT
 
-# PATH [NAME=VALUE...] -- COMMAND ARGUMENT...: `campaign COMMAND ARGUMENT...` in the campaign worktree at PATH, with the
-# settings NAME=VALUE.
+# PATH MAIN [NAME=VALUE...] -- COMMAND ARGUMENT...: `campaign COMMAND ARGUMENT...` in the campaign worktree at PATH, with
+# the settings NAME=VALUE, by the kit of the machine's main clone at MAIN (its main branch's, pulled there by hand): a
+# campaign created by an older kit is driven by the current one.
 read -r -d '' FLEET_CAMPAIGN <<'SCRIPT' || true
 export PATH="$PATH:$HOME/.local/bin"
 cd -- "$1" || exit 1
-shift
+kit=$2/.agentic/bin/campaign
+[ -x "$kit" ] || kit=./.agentic/bin/campaign
+shift 2
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do export "$1"; shift; done
 [ "$#" -eq 0 ] || shift
-exec ./.agentic/bin/campaign "$@"
+exec "$kit" "$@"
 SCRIPT
 
 # The AGENTIC_* settings that travel with a command to another machine (NAME=VALUE, NUL-separated): the ones of this
@@ -233,7 +236,7 @@ travelling_settings() {
   fi | while IFS= read -r -d '' assignment; do
     case ${assignment%%=*} in
       AGENTIC_CACHE | AGENTIC_FLEET | AGENTIC_MACHINE_ID | AGENTIC_SSH | AGENTIC_PROVIDER_DIR | AGENTIC_SUPERVISOR | \
-        AGENTIC_SUPERVISED | AGENTIC_CAMPAIGN_ROOT | AGENTIC_QUEUE) ;;
+        AGENTIC_SUPERVISED | AGENTIC_CAMPAIGN_ROOT | AGENTIC_QUEUE | AGENTIC_OPEN_VIA) ;;
       *) printf '%s\0' "$assignment" ;;
     esac
   done
@@ -406,8 +409,10 @@ fleet_survey() {
       warning=$(fleet_main_warning "$name" "${there:-0}" "${here:-0}")
       [[ -z $warning ]] || warnings+=("$warning")
       if [[ $want == true ]]; then
-        entry=$(jq -c --arg now "$now" --slurpfile overview "$fleet_temp/$name.overview" \
-          '. + {seen_at: $now} + $overview[0]' <<<"$entry")
+        entry=$(jq -c --arg now "$now" --slurpfile overview "$fleet_temp/$name.overview" --arg via "ssh -t $ssh" '
+          . + {seen_at: $now} + $overview[0]
+          | .campaigns |= map(if .open then .open = "\($via) '"'"'" + (.open | gsub("'"'"'"; "'"'"'\\'"'"''"'"'")) + "'"'"'" else . end)' \
+          <<<"$entry")
         seen=$(jq -c --arg name "$name" --arg now "$now" --slurpfile overview "$fleet_temp/$name.overview" \
           '.[$name] = {at: $now, overview: $overview[0]}' <<<"$seen")
       fi
@@ -821,7 +826,7 @@ route_campaign() {
     if [[ -f $file ]] && git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/campaign/$slug"; then
       tree=$(jq -r '.worktree' "$file")
       [[ -d $tree ]] || die "campaign $slug has no worktree here: $tree"
-      cd -- "$tree" && exec ./.agentic/bin/campaign "$command" "$@"
+      cd -- "$tree" && exec "$AGENTIC_DIR/bin/campaign" "$command" "$@"
     fi
     [[ -z $machine ]] || die "campaign $slug is not on this machine"
   elif ! jq -e --arg machine "$machine" '.machines[$machine] != null' <<<"$FLEET" >/dev/null; then
@@ -840,8 +845,15 @@ route_campaign() {
   name=$(jq -r '.[0].name' <<<"$found"); destination=$(jq -r '.[0].ssh' <<<"$found"); tree=$(jq -r '.[0].worktree' <<<"$found")
   printf 'campaign %s on %s (%s)\n' "$command" "$name" "$slug" >&2
   mapfile -d '' -t settings < <(travelling_settings)
-  remote_script "$FLEET_CAMPAIGN" "$tree" "${settings[@]}" -- "$command" "$@" || rc=$?
+  # Where the person is: the way to open the campaign starts with the ssh to its machine.
+  settings+=("AGENTIC_OPEN_VIA=ssh -t $destination")
+  remote_script "$FLEET_CAMPAIGN" "$tree" "$(fleet_project_path "$name")" "${settings[@]}" -- "$command" "$@" || rc=$?
   exit "$rc"
+}
+
+# The clone of this project on the machine NAME of the fleet.
+fleet_project_path() {
+  jq -r --arg project "$FLEET_PROJECT" --arg name "$1" '.projects[$project].paths[$name] // ""' <<<"$FLEET"
 }
 
 # finalize_here SLUG MACHINE ARGUMENT...: finalizes campaign SLUG into this machine's main branch: in its worktree when
@@ -861,11 +873,12 @@ finalize_here() {
     (($(jq 'length' <<<"$found") == 1)) || die "campaign $slug is on no machine of the fleet, or on several (pass --on MACHINE)"
     destination=$(jq -r '.[0].ssh' <<<"$found")
     note "Bringing $slug here from $(jq -r '.[0].name' <<<"$found") to finalize it into this machine's $MAIN_BRANCH..."
-    remote_script "$FLEET_CAMPAIGN" "$(jq -r '.[0].worktree' <<<"$found")" -- move --to "$FLEET_SELF" --no-start \
+    remote_script "$FLEET_CAMPAIGN" "$(jq -r '.[0].worktree' <<<"$found")" "$(fleet_project_path "$(jq -r '.[0].name' <<<"$found")")" \
+      -- move --to "$FLEET_SELF" --no-start \
       || die "could not bring $slug here"
   fi
   tree=$(jq -r '.worktree' "$file")
-  cd -- "$tree" && exec ./.agentic/bin/campaign finalize "$@"
+  cd -- "$tree" && exec "$AGENTIC_DIR/bin/campaign" finalize "$@"
 }
 
 cmd_fleet() {

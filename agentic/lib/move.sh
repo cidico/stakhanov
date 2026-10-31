@@ -161,13 +161,15 @@ cmd_move() {
   jq -n --arg slug "$slug" --arg to "$target" --argjson epoch "$((epoch + 1))" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{slug: $slug, moved_to: $to, epoch: $epoch, at: $at}' >"$marker"
   note "Campaign $slug moved to $target ($adopted)."
+  note "Open it there: $(open_command "$adopted" "${provider:-claude}" "ssh -t $destination")"
 
   if $start; then
     [[ -n $provider ]] || { note "Not started on $target: it never ran (campaign run --campaign $slug --provider NAME)."; return 0; }
     note "Starting it there, with the last run's settings..."
     local -a settings
     mapfile -d '' -t settings < <(travelling_settings "$fleet_temp/run-config.json")
-    remote_script "$FLEET_CAMPAIGN" "$adopted" "${settings[@]}" -- run --provider "$provider" --workers "$workers" --mode unattended \
+    remote_script "$FLEET_CAMPAIGN" "$adopted" "$path" "${settings[@]}" "AGENTIC_OPEN_VIA=ssh -t $destination" \
+      -- run --provider "$provider" --workers "$workers" --mode unattended \
       || die "$slug moved to $target but did not start there: campaign run --campaign $slug --provider $provider"
   fi
 }

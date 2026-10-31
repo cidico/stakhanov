@@ -48,7 +48,9 @@ say they may be out of date. With one machine, omit the machine heading.
 Layout per campaign:
 
 1. Heading: runner icon, slug, `done/total`, then one bar of colored squares, one per ticket in id
-   order (above 30 tickets, group in blocks of 5 by majority status).
+   order (above 30 tickets, group in blocks of 5 by majority status). Right below it, one line with 📍 the
+   campaign's `machine` and its `worktree` path, and one line with the command that opens it, `open`, verbatim in a
+   code span (from another machine it already starts with the ssh to that machine): never rewrite it.
 2. A tree table of in-progress tickets, columns `| | Ticket | What | Now | Next | Started | Duration |` (headers translated):
    - Parent row per in-progress ticket: 🔄, **id** in bold, **what it does** in bold (the `goal`
      summarized in the user's language, at most 8 words), now (phase label + "N min ago" from

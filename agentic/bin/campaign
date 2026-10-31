@@ -216,7 +216,7 @@ active_executors() {
 
 cmd_status() {
   assert_campaign_branch
-  local json=false slug tickets runtime active=false pid='' decisions='[]' desired
+  local json=false slug tickets runtime active=false pid='' decisions='[]' desired provider location
   [[ ${1:-} == --json ]] && json=true
   slug=$(campaign_slug); runtime=$(ensure_runtime "$slug")
   tickets=$(python3 "$TICKET_TOOL" list "$(tickets_path "$slug")")
@@ -235,14 +235,19 @@ cmd_status() {
     decisions=$(jq -s '.' "$runtime"/decisions/*.json)
   fi
   desired=$(desired_state "$slug")
+  provider=$(jq -r '.provider // "claude"' "$runtime/run-config.json" 2>/dev/null || printf 'claude')
+  location=$(jq -cn --arg machine "$(machine_name)" --arg project "$(main_worktree)" --arg worktree "$REPO_ROOT" \
+    --arg provider "$provider" --arg open "$(open_command "$REPO_ROOT" "$provider")" \
+    '{machine:$machine, project:$project, worktree:$worktree, provider:$provider, open:$open}')
   if $json; then
     jq -cn --arg slug "$slug" --argjson active "$active" --arg pid "$pid" --arg desired "$desired" \
-      --argjson tickets "$tickets" --argjson decisions "$decisions" \
-      '{campaign:$slug,runner:{active:$active,pid:(if $pid=="" then null else ($pid|tonumber) end),desired:$desired},tickets:$tickets,decisions:$decisions}'
+      --argjson tickets "$tickets" --argjson decisions "$decisions" --argjson location "$location" \
+      '{campaign:$slug,runner:{active:$active,pid:(if $pid=="" then null else ($pid|tonumber) end),desired:$desired},location:$location,tickets:$tickets,decisions:$decisions}'
   else
     note "Campaign: $slug"
     note "Runner: $(if $active; then printf 'active (pid %s)' "$pid"; else printf 'inactive'; fi)$(
       [[ $desired != stopped ]] || { $active && printf ', stopping' || printf ', stopped'; })"
+    jq -r '"Machine: \(.machine)\nProject: \(.project)\nWorktree: \(.worktree)\nOpen: \(.open)"' <<<"$location"
     jq -r '.[] | "\(.id)\t\(.status)\t\(.risk)\(if .executor then "\texecutor=\(.executor)" else "" end)"' <<<"$tickets"
     jq -r '.[] | "DECISION\t\(.ticket)\t\(.reason)\toptions=\(.options|join(","))"' <<<"$decisions"
   fi
@@ -1103,6 +1108,8 @@ cmd_run() {
   else
     note 'Campaign runner completed during startup.'
   fi
+  note "Worktree: $REPO_ROOT ($(machine_name))"
+  note "Open: $(open_command "$REPO_ROOT" "$provider")"
   if [[ $mode == interactive ]]; then
     # The follower is disposable: closing the UI never signals the detached engine.
     tail -n +1 --pid="$child" -f "$runtime/events/campaign.ndjson" || true
@@ -1819,7 +1826,7 @@ print_overview() {
     note 'No campaigns or queues in the cache.'
     return
   fi
-  jq -r '.campaigns[] | "Campaign \(.slug): runner \(if .runner_active then "active" else "inactive" end)\(if .desired == "stopped" then (if .runner_active then ", stopping" else ", stopped" end) else "" end) — \(.counts | to_entries | map("\(.key)=\(.value)") | join(" "))\(if (.recent_events | length) > 0 then (.recent_events[-1] | " · last event \(.local_time // .time): \(.type)\(if .ticket then " \(.ticket)" else "" end)") else "" end)"' <<<"$1"
+  jq -r '.campaigns[] | "Campaign \(.slug): runner \(if .runner_active then "active" else "inactive" end)\(if .desired == "stopped" then (if .runner_active then ", stopping" else ", stopped" end) else "" end) — \(.counts | to_entries | map("\(.key)=\(.value)") | join(" "))\(if (.recent_events | length) > 0 then (.recent_events[-1] | " · last event \(.local_time // .time): \(.type)\(if .ticket then " \(.ticket)" else "" end)") else "" end)\(if .worktree then "\n  worktree: \(.worktree)" else "" end)\(if .open then "\n  open: \(.open)" else "" end)"' <<<"$1"
   jq -r '.queues[] | "Queue \(.name): \(.state) — \(.message)"' <<<"$1"
   jq -r '(.moved // [])[] | "Campaign \(.slug): moved to \(.moved_to) (\(.at))"' <<<"$1"
 }
@@ -1827,6 +1834,7 @@ print_overview() {
 # One view of every campaign and queue in the cache, for humans and for the campaign-status skill.
 cmd_overview() {
   local json=false fleet=false arg base file slug tree runtime tickets active active_ids decisions events campaigns='[]' queues moved
+  local machine project provider
   for arg in "$@"; do
     case $arg in
       --json) json=true ;;
@@ -1839,7 +1847,7 @@ cmd_overview() {
     fleet_overview "$json"
     return
   fi
-  base=$(runtime_base)
+  base=$(runtime_base); machine=$(machine_name); project=$(main_worktree)
   for file in "$base"/*/campaign.json; do
     [[ -f $file ]] || continue
     runtime=$(dirname -- "$file"); slug=$(jq -r '.slug' "$file"); tree=$(jq -r '.worktree' "$file")
@@ -1854,9 +1862,13 @@ cmd_overview() {
     decisions=$( (cat "$runtime"/decisions/*.json 2>/dev/null || true) | jq -sc '.')
     events=$( (tail -n 10 "$runtime/events/campaign.ndjson" 2>/dev/null || true) | with_local_time)
     tickets=$(ticket_progress "$tickets" "$runtime/events/campaign.ndjson")
+    provider=$(jq -r '.provider // "claude"' "$runtime/run-config.json" 2>/dev/null || printf 'claude')
     campaigns=$(jq -c --arg slug "$slug" --arg tree "$tree" --argjson active "$active" --argjson tickets "$tickets" \
       --argjson decisions "$decisions" --argjson events "$events" --arg desired "$(jq -r '.desired // "running"' "$file")" \
-      '. + [{slug:$slug, worktree:$tree, runner_active:$active, desired:$desired,
+      --arg machine "$machine" --arg project "$project" --arg provider "$provider" \
+      --arg open "$(open_command "$tree" "$provider")" \
+      '. + [{slug:$slug, machine:$machine, project:$project, worktree:$tree, provider:$provider, open:$open,
+             runner_active:$active, desired:$desired,
              counts:($tickets | group_by(.status) | map({key:.[0].status, value:length}) | from_entries),
              tickets:$tickets, decisions:$decisions, recent_events:$events}]' <<<"$campaigns")
   done
