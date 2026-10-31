@@ -32,3 +32,9 @@ missing or disallowed role values stop before a model call. No policy changes mo
 The coordinator is the interactive session; its entry records the requested effort, while the
 shell supervisor is deterministic and has no model. Per-ticket entries document classification;
 execution uses the role override when all tickets require the same effort.
+
+## Readiness
+
+`run.sh --ready` exits 0 when `codex` is installed and signed in, 69 when it is missing, 77 when it is not signed in; `run.sh --install`
+installs it for the current user and `run.sh --login` signs in interactively. `campaign fleet join` uses them on a new
+machine.

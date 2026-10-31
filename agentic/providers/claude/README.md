@@ -35,3 +35,9 @@ means no account is left, and any other status means it was not a usage limit: t
 hook. A missing command, a disabled hook or an unusable account leaves claude in the caller's account.
 
 The runner prompt names the project's instruction files, so no Claude-specific project rule exists.
+
+## Readiness
+
+`run.sh --ready` exits 0 when `claude` is installed and signed in, 69 when it is missing, 77 when it is not signed in; `run.sh --install`
+installs it for the current user and `run.sh --login` signs in interactively. `campaign fleet join` uses them on a new
+machine.

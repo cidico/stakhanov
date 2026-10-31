@@ -6,6 +6,16 @@ adapter_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=../common.sh
 source "$adapter_dir/../common.sh"
 
+# --ready: 0 when grok is installed, 69 when it is missing (grok has no sign-in status to read: a run that is not signed
+# in fails as a provider error). --install: installs grok for this user (npm, into ~/.local). --login: signs in,
+# interactively.
+case ${1:-} in
+  --ready)
+    command -v grok >/dev/null 2>&1 && grok --version >/dev/null 2>&1 || { printf 'grok is not installed\n' >&2; exit 69; }
+    exit 0 ;;
+  --install) npm install -g --prefix "$HOME/.local" @xai-official/grok; exit ;;
+  --login) exec grok login ;;
+esac
 if [[ ${1:-} == --preflight ]]; then
   [[ $# == 2 && ($2 == interactive || $2 == unattended) ]] || exit 64
   command -v grok >/dev/null 2>&1 || exit 69

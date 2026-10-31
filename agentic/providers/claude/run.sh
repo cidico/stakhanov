@@ -6,6 +6,18 @@ adapter_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=../common.sh
 source "$adapter_dir/../common.sh"
 
+# --ready: 0 when claude is installed and signed in, 69 when it is missing, 77 when it is not signed in.
+# --install: installs claude for this user (the official installer, into ~/.local/bin). --login: signs in, interactively
+# (the link opens in a browser anywhere; the code comes back here).
+case ${1:-} in
+  --ready)
+    # A claude on the PATH may be a wrapper of the system around each user's own installation: it must also run.
+    command -v claude >/dev/null 2>&1 && claude --version >/dev/null 2>&1 || { printf 'claude is not installed\n' >&2; exit 69; }
+    claude auth status --json 2>/dev/null | jq -e '.loggedIn == true' >/dev/null || { printf 'claude is not signed in\n' >&2; exit 77; }
+    exit 0 ;;
+  --install) curl -fsSL https://claude.ai/install.sh | bash; exit ;;
+  --login) exec claude auth login ;;
+esac
 if [[ ${1:-} == --preflight ]]; then
   [[ $# == 2 && ($2 == interactive || $2 == unattended) ]] || exit 64
   command -v claude >/dev/null 2>&1 || exit 69

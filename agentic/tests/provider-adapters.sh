@@ -455,6 +455,33 @@ assert_command 'Unavailable provider fails clearly with structured event' \
   "$runtime/unavailable-result.json" "$runtime/unavailable-events.jsonl" "$unavailable_bin" \
   "$kit/providers/claude/run.sh" "$workspace" "$runtime/prompt.md"
 
+# --ready reads the sign-in state without a model turn: 0 signed in, 77 not signed in, 69 missing.
+ready_bin="$test_root/ready-bin"
+mkdir -p "$ready_bin/in" "$ready_bin/out"
+cat >"$ready_bin/in/claude" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == "--version" ]] && exit 0
+[[ "$*" == "auth status --json" ]] && printf '{"loggedIn":true,"authMethod":"claude.ai"}\n'
+EOF
+cat >"$ready_bin/out/claude" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == "--version" ]] && exit 0
+[[ "$*" == "auth status --json" ]] && { printf '{"loggedIn":false}\n'; exit 1; }
+EOF
+# A wrapper of the system with no installation behind it, for this user.
+mkdir -p "$ready_bin/wrapper"
+printf '#!/usr/bin/env bash\necho "not installed for this user" >&2\nexit 1\n' >"$ready_bin/wrapper/claude"
+printf '#!/usr/bin/env bash\n[[ "$*" == "login status" || "$*" == --version ]]\n' >"$ready_bin/in/codex"
+printf '#!/usr/bin/env bash\n[[ "$*" == --version ]]\n' >"$ready_bin/out/codex"
+chmod +x "$ready_bin"/in/* "$ready_bin"/out/* "$ready_bin"/wrapper/*
+ready_status() { local status=0; env PATH="$1:/usr/bin:/bin" "$kit/providers/$2/run.sh" --ready >/dev/null 2>&1 || status=$?; [[ $status == "$3" ]]; }
+assert_command 'Claude is ready when signed in' ready_status "$ready_bin/in" claude 0
+assert_command 'Claude is not ready when not signed in' ready_status "$ready_bin/out" claude 77
+assert_command 'Claude is unavailable when missing' ready_status "$unavailable_bin" claude 69
+assert_command 'Claude is unavailable behind a wrapper with nothing installed' ready_status "$ready_bin/wrapper" claude 69
+assert_command 'Codex is ready when signed in' ready_status "$ready_bin/in" codex 0
+assert_command 'Codex is not ready when not signed in' ready_status "$ready_bin/out" codex 77
+
 printf '1..%s\n' "$((passed + failed))"
 if (( failed != 0 )); then
   exit 1

@@ -6,6 +6,16 @@ adapter_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=../common.sh
 source "$adapter_dir/../common.sh"
 
+# --ready: 0 when codex is installed and signed in, 69 when it is missing, 77 when it is not signed in.
+# --install: installs codex for this user (npm, into ~/.local). --login: signs in, interactively.
+case ${1:-} in
+  --ready)
+    command -v codex >/dev/null 2>&1 && codex --version >/dev/null 2>&1 || { printf 'codex is not installed\n' >&2; exit 69; }
+    codex login status >/dev/null 2>&1 || { printf 'codex is not signed in\n' >&2; exit 77; }
+    exit 0 ;;
+  --install) npm install -g --prefix "$HOME/.local" @openai/codex; exit ;;
+  --login) exec codex login ;;
+esac
 if [[ ${1:-} == --preflight ]]; then
   [[ $# == 2 && ($2 == interactive || $2 == unattended) ]] || exit 64
   command -v codex >/dev/null 2>&1 || exit 69

@@ -22,3 +22,9 @@ with `AGENTIC_GROK_WORKER_EFFORT`, `AGENTIC_GROK_REVIEWER_EFFORT`, or
 Smoke validated locally against Grok 1.0.13: prompt file, cwd, JSON output, JSON Schema, subagent
 control, always-approve, permission mode, effort, and model flags are accepted by the installed CLI.
 No model invocation was made.
+
+## Readiness
+
+`run.sh --ready` exits 0 when `grok` is installed, 69 when it is missing; `run.sh --install`
+installs it for the current user and `run.sh --login` signs in interactively. `campaign fleet join` uses them on a new
+machine.
