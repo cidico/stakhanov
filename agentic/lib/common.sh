@@ -3,6 +3,13 @@
 set -Eeuo pipefail
 umask 077
 IFS=$'\n\t'
+# Reached over ssh without a login session (an sshd without PAM, as from another machine of the fleet), the shell lacks
+# the user's runtime folder, and the supervisor and the background scope would silently be skipped: systemctl --user
+# and systemd-run --user cannot reach the user's manager. It is the usual one.
+if [[ -z ${XDG_RUNTIME_DIR:-} && -d /run/user/$(id -u) ]]; then export XDG_RUNTIME_DIR="/run/user/$(id -u)"; fi
+if [[ -z ${DBUS_SESSION_BUS_ADDRESS:-} && -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
 
 die() { printf 'campaign: %s\n' "$*" >&2; exit 2; }
 require_command() { command -v "$1" >/dev/null 2>&1 || die "required command unavailable: $1"; }
