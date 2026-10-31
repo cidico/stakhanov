@@ -205,13 +205,14 @@ packages_for() {
   case "$cmd" in
     python3) if [[ $manager == pacman ]]; then echo python; else echo python3; fi ;;
     flock|setsid) echo util-linux ;;
+    cmp) echo diffutils ;;
     npm) echo nodejs; echo npm ;;
     *) echo "$cmd" ;;
   esac
 }
 
 install_system_commands() {
-  local needed=(git jq python3 flock setsid curl tar) cmd p manager='' m
+  local needed=(git jq python3 flock setsid cmp curl tar) cmd p manager='' m
   local missing=() pkgs=() prefix commands=() line
   local need_npm=false
   for p in "${providers[@]}"; do
@@ -358,7 +359,7 @@ if [[ $machine_setup == true ]]; then
 fi
 
 missing=()
-for cmd in bash git jq python3 flock setsid tar; do
+for cmd in bash git jq python3 flock setsid cmp tar; do
   command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 ((${#missing[@]} == 0)) || die "missing required commands: $(join ' ' "${missing[@]}") (run without --no-machine-setup to install them)"
