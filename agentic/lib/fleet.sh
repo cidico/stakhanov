@@ -537,13 +537,13 @@ fleet_project_setup() {
   done
   mapfile -t setup < <(jq -r --arg project "$FLEET_PROJECT" '.projects[$project].setup // [] | .[]' <<<"$FLEET")
   ((${#setup[@]} > 0)) || return 0
-  note "Running the setup of $FLEET_PROJECT on $machine: ${setup[*]}"
+  note "Running the setup of $FLEET_PROJECT on $machine: $(printf '%s ' "${setup[@]}")"
   if fleet_interactive; then
     fleet_tty "$FLEET_SETUP" "$path" "${setup[@]}" || rc=$?
   else
     remote_script "$FLEET_SETUP" "$path" "${setup[@]}" || rc=$?
   fi
-  ((rc == 0)) || pending+=("the setup of $FLEET_PROJECT failed on $machine (exit $rc): ${setup[*]}, in $path")
+  ((rc == 0)) || pending+=("the setup of $FLEET_PROJECT failed on $machine (exit $rc): $(printf '%s ' "${setup[@]}")in $path")
 }
 
 # fleet_linger NAME: the user of NAME ($destination) lingers, so a runner outlives the session that started it.

@@ -573,7 +573,7 @@ case $1 in show-user) echo no ;; enable-linger) echo 'Access denied' >&2; exit 1
         result = self.join(check=False)
         self.assertEqual(result.returncode, 3)
         self.assertIn("missing.env (files of proof in the fleet file) does not exist in this clone", result.stdout)
-        self.assertIn("the setup of proof failed on box (exit 1): false", result.stdout)
+        self.assertIn("the setup of proof failed on box (exit 1): false in", result.stdout)
 
     def test_without_a_fleet(self):
         self.assertIn("No fleet holds proof", self.repo.command("fleet").stdout)
