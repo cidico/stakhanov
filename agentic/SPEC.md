@@ -2,7 +2,7 @@
 
 The canonical specification is `campaigns/<slug>/SPEC.md`. It is produced by Matt Pocock's `/to-spec`
 (installed unmodified from his repository by `install.sh`), which publishes through the tracker configuration in
-`docs/agents/issue-tracker.md`: the skill writes the spec to a temporary file outside the repository and
+`.agentic/ISSUE-TRACKER.md`: the skill writes the spec to a temporary file outside the repository and
 runs `.agentic/bin/campaign init <spec-path> --slug <short-kebab-name>` from the main branch. Remove the
 temporary input after a successful initialization.
 
@@ -56,8 +56,8 @@ deterministic.
 
 `init` refuses, before creating anything, when the spec lacks a required section or has a blocking open
 question, when the current branch is not the main branch, when the campaign branch already exists, and when the
-main branch has no committed `.agentic/bin/campaign`: commit the installed kit (`.agentic`, the skills,
-`AGENTS.md` and `docs/agents/issue-tracker.md`) on the main branch first, because the campaign worktree and the
+main branch has no committed `.agentic/bin/campaign`: commit the installed kit (`.agentic`, the skills
+and `AGENTS.md`) on the main branch first, because the campaign worktree and the
 engine come from the committed branch.
 
 Initialization moves an untracked root `SPEC.md` draft into the committed canonical path. Tracked or

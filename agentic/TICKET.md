@@ -1,7 +1,7 @@
 # Campaign ticket contract
 
 Tickets live at `campaigns/<slug>/tickets/<id>.md`. `/to-tickets` (Matt Pocock's skill, installed by `install.sh`)
-writes them into the campaign worktree through `docs/agents/issue-tracker.md`; `campaign verify` checks them.
+writes them into the campaign worktree through `.agentic/ISSUE-TRACKER.md`; `campaign verify` checks them.
 A ticket id is a capitalized prefix, a hyphen and at least three digits (`^[A-Z][A-Z0-9]*-[0-9]{3,}$`, for
 example `AUTH-001`). Start every ticket with:
 

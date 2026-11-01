@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepare the machine and install the Stakhanov campaign kit into a Git project.
-#   install.sh [--providers claude,codex,grok] [--update [--force]] [--replace-tracker]
+#   install.sh [--providers claude,codex,grok] [--update [--force]]
 #              [--yes] [--no-machine-setup] [--matt-ref REF] <project-dir>
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -15,12 +15,15 @@ MATT_TARBALL=https://codeload.github.com/mattpocock/skills/tar.gz
 CLAUDE_INSTALLER_URL=https://claude.ai/install.sh
 CODEX_NPM_PACKAGE=@openai/codex
 GROK_NPM_PACKAGE=@xai-official/grok
-TRACKER=docs/agents/issue-tracker.md
+# The tracker configuration is a file of the engine (installed with .agentic). Earlier kits wrote it into the
+# project, at OLD_TRACKER.
+TRACKER=.agentic/ISSUE-TRACKER.md
+OLD_TRACKER=docs/agents/issue-tracker.md
 INSTRUCTION_FILE=AGENTS.md
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--providers claude,codex,grok] [--update [--force]] [--replace-tracker]
+Usage: install.sh [--providers claude,codex,grok] [--update [--force]]
                   [--yes] [--no-machine-setup] [--matt-ref REF] <project-dir>
 
 Prepares the machine (missing system commands, provider CLIs, Matt Pocock's skills), then installs the kit
@@ -32,8 +35,6 @@ into the project.
                       share); the kit's own tests and project.json.example are never copied.
   --update            replace an existing .agentic (keeping project.json) and the provider skills
   --force             with --update: also delete files of .agentic that the kit does not ship
-  --replace-tracker   overwrite an existing docs/agents/issue-tracker.md with the kit's template
-                      (it is never overwritten otherwise, not even with --update)
   --yes               do not ask before installing system packages and provider CLIs
   --no-machine-setup  skip the machine setup (system commands, provider CLIs, Matt's skills): for CI
   --matt-ref REF      Git ref of github.com/mattpocock/skills to take the skills from (default: main)
@@ -49,7 +50,6 @@ join() { local sep=$1 out='' item; shift; for item in "$@"; do out+=${out:+$sep}
 providers_arg=''
 update=false
 force=false
-replace_tracker=false
 assume_yes=false
 machine_setup=true
 matt_ref=main
@@ -60,7 +60,6 @@ while (($#)); do
     --providers=*) providers_arg=${1#*=}; shift ;;
     --update) update=true; shift ;;
     --force) force=true; shift ;;
-    --replace-tracker) replace_tracker=true; shift ;;
     --yes|-y) assume_yes=true; shift ;;
     --no-machine-setup) machine_setup=false; shift ;;
     --matt-ref) (($# >= 2)) || die '--matt-ref needs a value'; matt_ref=$2; shift 2 ;;
@@ -84,6 +83,7 @@ trap '[[ -z $work_tmp ]] || rm -rf -- "$work_tmp"' EXIT
 
 created=()
 changed=()
+removed=()
 warnings=()
 machine_done=()
 login_needed=()
@@ -421,17 +421,20 @@ for p in "${providers[@]}"; do
   done
 done
 
-# Tracker configuration: /to-spec and /to-tickets publish wherever this file says.
-if [[ ! -e $project/$TRACKER ]]; then
-  mkdir -p "$project/docs/agents"
-  cp "$KIT/templates/$TRACKER" "$project/$TRACKER"
-  created+=("$TRACKER")
-elif ! cmp -s -- "$KIT/templates/$TRACKER" "$project/$TRACKER"; then
-  if [[ $replace_tracker == true ]]; then
-    cp -- "$KIT/templates/$TRACKER" "$project/$TRACKER"
-    changed+=("$TRACKER (replaced with the kit's template)")
+# Tracker configuration: /to-spec and /to-tickets publish wherever it says. It is a file of the engine, so the copy
+# above already installed it. Earlier kits wrote a copy into the project: an identical one is now dead weight and is
+# removed (with the folders it leaves empty); a different one is kept, but nothing reads it any more.
+old_tracker_staged=false
+if [[ -e $project/$OLD_TRACKER || -L $project/$OLD_TRACKER ]]; then
+  if [[ -f $project/$OLD_TRACKER && ! -L $project/$OLD_TRACKER ]] && cmp -s -- "$KIT/agentic/ISSUE-TRACKER.md" "$project/$OLD_TRACKER"; then
+    # `git add` of a tracked path that no longer exists stages its deletion; of an untracked one it fails.
+    if git -C "$project" ls-files --error-unmatch -- "$OLD_TRACKER" >/dev/null 2>&1; then old_tracker_staged=true; fi
+    rm -f -- "$project/$OLD_TRACKER"
+    rmdir -- "$project/$(dirname -- "$OLD_TRACKER")" 2>/dev/null || true
+    rmdir -- "$project/$(dirname -- "$(dirname -- "$OLD_TRACKER")")" 2>/dev/null || true
+    removed+=("$OLD_TRACKER (the kit now reads $TRACKER)")
   else
-    warnings+=("WARNING: $TRACKER already exists and differs from the kit's template, so it was kept. /to-spec and /to-tickets publish wherever that file says, NOT into campaigns, and the campaign workflow will not work until it says so. Replace it with templates/$TRACKER from the kit, or run this installer again with --replace-tracker (it overwrites the file).")
+    warnings+=("WARNING: $OLD_TRACKER differs from the kit's tracker configuration and was kept, but it is ignored: the kit now reads $TRACKER, installed with the engine. /to-spec and /to-tickets publish into campaigns as that file says. Delete $OLD_TRACKER when you no longer need it.")
   fi
 fi
 
@@ -504,6 +507,7 @@ note ''
 if ((${#machine_done[@]})); then note 'Installed on this machine:'; printf '  %s\n' "${machine_done[@]}"; note ''; fi
 if ((${#created[@]})); then note 'Created in the project:'; printf '  %s\n' "${created[@]}"; fi
 if ((${#changed[@]})); then note 'Changed in the project:'; printf '  %s\n' "${changed[@]}"; fi
+if ((${#removed[@]})); then note 'Removed from the project:'; printf '  %s\n' "${removed[@]}"; fi
 if ((${#warnings[@]})); then note ''; printf '%s\n' "${warnings[@]}"; fi
 if ((${#login_needed[@]})); then
   note ''
@@ -513,7 +517,8 @@ fi
 
 commit_paths=(.agentic)
 for p in "${providers[@]}"; do commit_paths+=(".$p/skills"); done
-commit_paths+=("$INSTRUCTION_FILE" "$TRACKER")
+commit_paths+=("$INSTRUCTION_FILE")
+[[ $old_tracker_staged == false ]] || commit_paths+=("$OLD_TRACKER")
 commit_list=$(join ' ' "${commit_paths[@]}")
 cat <<NEXT
 

@@ -69,7 +69,8 @@ setup() { # NAME [BRANCH] -> sets repo and home
   home=$(new_home "$1")
   seed_matt "$home/.claude/skills"
 }
-TEMPLATE_TRACKER=$ROOT/templates/docs/agents/issue-tracker.md
+KIT_TRACKER=$ROOT/agentic/ISSUE-TRACKER.md
+OLD_TRACKER=docs/agents/issue-tracker.md
 
 # --- Fresh install on main.
 setup fresh-main
@@ -88,13 +89,16 @@ t 'fresh install on main: the kit tests and project.json.example stay in the kit
   bash -c '[[ ! -e $1/.agentic/tests && ! -e $1/.agentic/project.json.example ]]' _ "$repo"
 t 'fresh install on main: provider skills are installed' test -f "$repo/.claude/skills/run-campaign/SKILL.md"
 t 'fresh install on main: only the chosen provider is installed' bash -c '[[ ! -e $1/.codex && ! -e $1/.grok ]]' _ "$repo"
-t 'fresh install on main: tracker equals the template' cmp -s "$TEMPLATE_TRACKER" "$repo/docs/agents/issue-tracker.md"
+t 'fresh install on main: .agentic/ISSUE-TRACKER.md equals the kit tracker' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
+t 'fresh install on main: nothing is written under docs' test ! -e "$repo/docs"
+t 'fresh install on main: AGENTS.md points to .agentic/ISSUE-TRACKER.md' \
+  bash -c 'grep -q "see \`.agentic/ISSUE-TRACKER.md\`" "$1" && ! grep -q "docs/agents" "$1"' _ "$repo/AGENTS.md"
 t 'fresh install on main: AGENTS.md carries the block between its markers' \
   bash -c 'grep -q "^<!-- stakhanov:start -->$" "$1" && grep -q "^<!-- stakhanov:end -->$" "$1"' _ "$repo/AGENTS.md"
 t 'fresh install on main: CLAUDE.md is not created' test ! -e "$repo/CLAUDE.md"
 t 'fresh install on main: no warning when Matt skills are present' out_lacks 'WARNING'
 t 'fresh install on main: prints the next steps in order' \
-  bash -c 'grep -q "/grilling -> /to-spec -> /to-tickets -> /run-campaign -> /finalize-campaign" <<<"$1" && grep -q "git add .agentic .claude/skills AGENTS.md docs/agents/issue-tracker.md" <<<"$1"' _ "$OUT"
+  bash -c 'grep -q "/grilling -> /to-spec -> /to-tickets -> /run-campaign -> /finalize-campaign" <<<"$1" && grep -q "git add .agentic .claude/skills AGENTS.md\$" <<<"$1"' _ "$OUT"
 t 'fresh install on main: nothing is written to HOME' [ "$before_home" = "$(cd "$home" && find . | sort)" ]
 t 'fresh install on main: nothing is committed' [ "$(git -C "$repo" rev-list --count HEAD)" = 1 ]
 
@@ -150,20 +154,82 @@ t 'CLAUDE.md only: CLAUDE.md is byte-identical' cmp -s "$work/CLAUDE.md.orig" "$
 inst "$home" --update "$repo"
 t 'CLAUDE.md only: still byte-identical after --update' cmp -s "$work/CLAUDE.md.orig" "$repo/CLAUDE.md"
 
-# --- Tracker that differs from the template.
-setup tracker
-mkdir -p "$repo/docs/agents"
-printf '# Issue tracker: GitHub\n\nIssues on GitHub.\n' >"$repo/docs/agents/issue-tracker.md"
-cp -p -- "$repo/docs/agents/issue-tracker.md" "$work/tracker.orig"
+# --- Tracker: an engine file. A copy that earlier kits wrote into the project is migrated.
+setup tracker-absent
 inst "$home" --providers claude "$repo"
-t 'differing tracker: warns that skills will not publish into campaigns' bash -c 'grep -q "issue-tracker.md" <<<"$1" && grep -q "NOT into campaigns" <<<"$1"' _ "$OUT"
-t 'differing tracker: kept' cmp -s "$work/tracker.orig" "$repo/docs/agents/issue-tracker.md"
+t 'no old tracker: no tracker warning' out_lacks 'issue-tracker.md'
+t 'no old tracker: nothing is listed as removed' out_lacks 'Removed from the project'
 inst "$home" --update "$repo"
-t 'differing tracker: kept and warned again on --update' bash -c 'grep -q "NOT into campaigns" <<<"$1"' _ "$OUT"
-t 'differing tracker: --update does not overwrite it' cmp -s "$work/tracker.orig" "$repo/docs/agents/issue-tracker.md"
-inst "$home" --update --replace-tracker "$repo"
-t '--replace-tracker: overwrites it with the template' cmp -s "$TEMPLATE_TRACKER" "$repo/docs/agents/issue-tracker.md"
-t '--replace-tracker: no tracker warning' out_lacks 'NOT into campaigns'
+t 'no old tracker, --update: .agentic/ISSUE-TRACKER.md is restored' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
+printf 'stale\n' >"$repo/.agentic/ISSUE-TRACKER.md"
+inst "$home" --update "$repo"
+t 'no old tracker, --update: an edited .agentic/ISSUE-TRACKER.md is replaced by the kit one' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
+
+# An identical old copy (committed, as a real project has it) is deleted with the folders it leaves empty.
+setup tracker-identical
+mkdir -p "$repo/docs/agents"
+cp -- "$KIT_TRACKER" "$repo/$OLD_TRACKER"
+git -C "$repo" add "$OLD_TRACKER"
+git -C "$repo" commit -q -m 'old tracker'
+inst "$home" --providers claude "$repo"
+t 'identical old tracker: install succeeds' [ "$RC" -eq 0 ]
+t 'identical old tracker: the file is deleted' test ! -e "$repo/$OLD_TRACKER"
+t 'identical old tracker: docs/agents and docs are deleted when empty' test ! -e "$repo/docs"
+t 'identical old tracker: .agentic/ISSUE-TRACKER.md is installed' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
+t 'identical old tracker: listed under Removed from the project' \
+  bash -c 'grep -A1 "^Removed from the project:" <<<"$1" | grep -q "docs/agents/issue-tracker.md"' _ "$OUT"
+t 'identical old tracker: no tracker warning' out_lacks 'WARNING'
+t 'identical old tracker: the printed git add includes the removal' \
+  bash -c 'grep -q "git add .agentic .claude/skills AGENTS.md docs/agents/issue-tracker.md\$" <<<"$1"' _ "$OUT"
+t 'identical old tracker: running the printed git add stages the deletion' \
+  bash -c 'cd "$1" && git add .agentic .claude/skills AGENTS.md docs/agents/issue-tracker.md && git diff --cached --no-renames --name-status | grep -q "^D.docs/agents/issue-tracker.md$" && [[ -z $(git status --porcelain | grep "^.D") ]]' _ "$repo"
+inst "$home" --update "$repo"
+t 'identical old tracker: a second run has nothing to remove' bash -c '! grep -q "Removed from the project" <<<"$1" && ! grep -q "docs/agents" <<<"$1"' _ "$OUT"
+
+# An identical old copy that was never committed: deleted, and not named in git add (it would fail there).
+setup tracker-identical-untracked
+mkdir -p "$repo/docs/agents"
+cp -- "$KIT_TRACKER" "$repo/$OLD_TRACKER"
+inst "$home" --providers claude "$repo"
+t 'identical untracked old tracker: the file and its folders are deleted' test ! -e "$repo/docs"
+t 'identical untracked old tracker: listed under Removed from the project' out_has 'Removed from the project'
+t 'identical untracked old tracker: git add does not name the old path' \
+  bash -c 'grep -q "git add .agentic .claude/skills AGENTS.md\$" <<<"$1"' _ "$OUT"
+
+# Folders that still hold something are kept.
+setup tracker-identical-shared
+mkdir -p "$repo/docs/agents"
+cp -- "$KIT_TRACKER" "$repo/$OLD_TRACKER"
+printf 'domain\n' >"$repo/docs/agents/domain.md"
+printf 'notes\n' >"$repo/docs/notes.md"
+inst "$home" --providers claude "$repo"
+t 'identical old tracker next to other files: only the tracker is deleted' \
+  bash -c '[[ ! -e $1/docs/agents/issue-tracker.md && -f $1/docs/agents/domain.md && -f $1/docs/notes.md ]]' _ "$repo"
+setup tracker-identical-docs
+mkdir -p "$repo/docs/agents"
+cp -- "$KIT_TRACKER" "$repo/$OLD_TRACKER"
+printf 'notes\n' >"$repo/docs/notes.md"
+inst "$home" --providers claude "$repo"
+t 'identical old tracker, docs with other files: docs/agents goes, docs stays' \
+  bash -c '[[ ! -e $1/docs/agents && -f $1/docs/notes.md ]]' _ "$repo"
+
+# A different old copy is kept and reported as ignored.
+setup tracker-different
+mkdir -p "$repo/docs/agents"
+printf '# Issue tracker: GitHub\n\nIssues on GitHub.\n' >"$repo/$OLD_TRACKER"
+cp -p -- "$repo/$OLD_TRACKER" "$work/tracker.orig"
+inst "$home" --providers claude "$repo"
+t 'differing old tracker: install succeeds' [ "$RC" -eq 0 ]
+t 'differing old tracker: kept' cmp -s "$work/tracker.orig" "$repo/$OLD_TRACKER"
+t 'differing old tracker: warns that it is ignored and names the file the kit reads' \
+  bash -c 'grep -q "WARNING: docs/agents/issue-tracker.md differs" <<<"$1" && grep -q "it is ignored: the kit now reads .agentic/ISSUE-TRACKER.md" <<<"$1"' _ "$OUT"
+t 'differing old tracker: .agentic/ISSUE-TRACKER.md is installed anyway' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
+t 'differing old tracker: nothing is listed as removed' out_lacks 'Removed from the project'
+t 'differing old tracker: git add does not name it' \
+  bash -c 'grep -q "git add .agentic .claude/skills AGENTS.md\$" <<<"$1"' _ "$OUT"
+inst "$home" --update "$repo"
+t 'differing old tracker: kept and warned again on --update' out_has 'WARNING: docs/agents/issue-tracker.md differs'
+t 'differing old tracker: --update does not touch it' cmp -s "$work/tracker.orig" "$repo/$OLD_TRACKER"
 
 # --- Foreign "## Agent skills" section.
 setup foreign-skills

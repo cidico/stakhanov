@@ -27,13 +27,14 @@ used unmodified. They are not stored in this kit: `install.sh` downloads them fr
 installs, and only when a skill is missing. `/run-campaign`, `/finalize-campaign` and `/campaign-status` are
 shipped here, for each provider.
 
-Matt's skills publish wherever `docs/agents/issue-tracker.md` tells them to. The installer writes that file so that
+Matt's skills publish wherever the tracker configuration tells them to. The kit ships it as an engine file,
+`.agentic/ISSUE-TRACKER.md`, installed (and replaced on every `--update`) with the rest of `.agentic`, so that
 `/to-spec` and `/to-tickets` publish into a campaign instead of into issues. It is exactly the "Other" tracker
 configuration his `/setup-matt-pocock-skills` would write.
 
 Documents installed with the engine, in `.agentic/`: `README.md` (what the runner enforces, the settings and
-the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.md`, `RUN-CAMPAIGN.md`,
-`FINALIZE-CAMPAIGN.md` and `roles/`.
+the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.md`, `ISSUE-TRACKER.md`,
+`RUN-CAMPAIGN.md`, `FINALIZE-CAMPAIGN.md` and `roles/`.
 
 ## Requirements
 
@@ -49,7 +50,7 @@ the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.m
 ## Install
 
 ```
-./install.sh [--providers claude,codex,grok] [--update [--force]] [--replace-tracker]
+./install.sh [--providers claude,codex,grok] [--update [--force]]
              [--yes] [--no-machine-setup] [--matt-ref REF] <project-dir>
 ```
 
@@ -96,9 +97,10 @@ must already be there, and a missing Matt skill only produces a warning.
 - copies the skills of each provider to `.claude/skills/`, `.codex/skills/` and `.grok/skills/`. Default: every
   provider whose CLI is on `PATH`, else `claude`; with `--update`, the providers whose skills are already
   installed;
-- creates `docs/agents/issue-tracker.md` when missing. An existing file that differs from the template is kept,
-  with a warning: `/to-spec` and `/to-tickets` would publish wherever it says, not into campaigns. Only
-  `--replace-tracker` overwrites it, `--update` included;
+- installs the tracker configuration as `.agentic/ISSUE-TRACKER.md`, with the rest of the engine. Earlier kits
+  wrote it into the project as `docs/agents/issue-tracker.md`: an identical copy is deleted (with `docs/agents` and
+  `docs`, when that leaves them empty) and listed under "Removed from the project"; a copy that differs is kept,
+  with a warning that the kit ignores it now;
 - inserts the workflow rules between `<!-- stakhanov:start -->` and `<!-- stakhanov:end -->` in `AGENTS.md`,
   creating it when missing. Text outside the markers is never touched. `CLAUDE.md` is never touched: Codex and
   Grok read only `AGENTS.md`, and Claude Code reads it too (if yours does not, add the line `@AGENTS.md` to
@@ -117,14 +119,15 @@ The installer never commits. A Claude Code plugin install of Matt's skills names
 
 1. Edit `.agentic/project.json` if needed (required checks, time zone, archive folder, remote executors). Its `name`
    is how a fleet knows the project.
-2. Commit `.agentic`, the provider skills, `AGENTS.md` and `docs/agents/issue-tracker.md` on the main branch.
+2. Commit `.agentic`, the provider skills and `AGENTS.md` on the main branch (and the removal of an old
+   `docs/agents/issue-tracker.md`, when the installer deleted it: the command it prints includes it).
    Do this before `/to-spec`: `campaign init` refuses a main branch without the committed kit, because the
    campaign worktree and the engine come from the committed branch. The same goes for later edits of
    `project.json`: they apply once committed.
 3. `/grilling` -> `/to-spec` -> `/to-tickets` -> `/run-campaign` -> `/finalize-campaign`.
 
-If you later run `/setup-matt-pocock-skills` in the project, choose the "Other" tracker and keep
-`docs/agents/issue-tracker.md` as it is; do not let it point to a hosted tracker or to `.scratch/`.
+If you later run `/setup-matt-pocock-skills` in the project, choose the "Other" tracker and let
+it point to `.agentic/ISSUE-TRACKER.md`; do not let it point to a hosted tracker or to `.scratch/`.
 
 ## Configuration
 
@@ -217,7 +220,7 @@ agentic/        engine, installed as <project>/.agentic/
   tests/        engine tests, run by `campaign self-test` in the kit (not copied to projects)
   *.md          the documents listed under Flow
 skills/         /run-campaign, /finalize-campaign and /campaign-status per provider
-templates/      the block inserted into AGENTS.md and the tracker configuration
+templates/      the block inserted into AGENTS.md
 executor/       the executor package, installed on a host with executor/install.sh (never into a project)
 tests/          installer tests
 install.sh

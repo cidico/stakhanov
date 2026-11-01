@@ -53,7 +53,7 @@ provider adapter.
 
 ### Issue tracker
 
-Specs and tickets are campaigns of `.agentic`; see `docs/agents/issue-tracker.md`.
+Specs and tickets are campaigns of `.agentic`; see `.agentic/ISSUE-TRACKER.md`.
 
 `grilling`, `to-spec` and `to-tickets` come from https://github.com/mattpocock/skills, unmodified, and are
 installed by `install.sh`.
