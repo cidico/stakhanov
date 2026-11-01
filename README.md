@@ -87,7 +87,10 @@ must already be there, and a missing Matt skill only produces a warning.
 
 - copies `agentic/` to `<project>/.agentic/` (refuses if it exists, or if it is a symlink; `--update` replaces
   everything except `project.json`, and refuses while `.agentic` holds files the kit does not ship, unless
-  `--force` deletes them);
+  `--force` deletes them). Only the adapters of the chosen providers go to `.agentic/providers/` (with the files
+  they share: `common.sh`, `extract-result.py`, `validate-result.py`); the kit's own `tests/` and
+  `project.json.example` stay in the kit, so a project that only uses `claude` never receives the `codex` and
+  `grok` adapters;
 - creates `.agentic/project.json` when missing, with the project name and the detected main branch (`main`, else
   `master`, else the current branch);
 - copies the skills of each provider to `.claude/skills/`, `.codex/skills/` and `.grok/skills/`. Default: every
@@ -209,9 +212,9 @@ agentic/        engine, installed as <project>/.agentic/
   bin/          campaign (the supervisor), campaign-watch, offload (a command on an executor)
   lib/          shared shell and Python helpers, remote.sh (one executor's steps), remote-run.sh (worker invocations),
                 fleet.sh (the fleet), move.sh (moving a campaign between machines)
-  providers/    claude, codex and grok adapters, RESULT parsing
+  providers/    claude, codex and grok adapters, RESULT parsing (a project receives only its providers')
   roles/        worker, reviewer and diagnostician prompts
-  tests/        engine tests, run by `campaign self-test`
+  tests/        engine tests, run by `campaign self-test` in the kit (not copied to projects)
   *.md          the documents listed under Flow
 skills/         /run-campaign, /finalize-campaign and /campaign-status per provider
 templates/      the block inserted into AGENTS.md and the tracker configuration
@@ -225,7 +228,7 @@ install.sh
 ```
 python3 -m unittest discover -s agentic/tests -p 'test_*.py'   # engine (mock providers, temporary repos)
 bash agentic/tests/provider-adapters.sh                        # adapter arguments and RESULT parsing
-agentic/bin/campaign self-test                                 # both, as installed in a project
+agentic/bin/campaign self-test                                 # both, from the kit (projects do not get agentic/tests)
 bash tests/install.sh                                          # the installer (temporary repos and homes, stubbed network, sudo and package managers)
 bash executor/tests/executor.sh                                # the executor package (stubbed systemd, namespaces, ssh and claude; no root)
 ```

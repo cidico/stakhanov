@@ -28,6 +28,8 @@ into the project.
 
   --providers LIST    comma-separated providers to set up. Default: the providers whose CLI is on PATH, and
                       claude when none is; with --update, the providers whose skills are already installed.
+                      Only these providers' adapters are copied into .agentic/providers (with the files they
+                      share); the kit's own tests and project.json.example are never copied.
   --update            replace an existing .agentic (keeping project.json) and the provider skills
   --force             with --update: also delete files of .agentic that the kit does not ship
   --replace-tracker   overwrite an existing docs/agents/issue-tracker.md with the kit's template
@@ -375,7 +377,14 @@ had_agentic=false
 # Engine. An existing project.json is never touched.
 mkdir -p "$project/.agentic"
 find "$project/.agentic" -mindepth 1 -maxdepth 1 ! -name project.json -exec rm -rf {} +
-tar -C "$KIT/agentic" --exclude='__pycache__' --exclude='*.pyc' -cf - . | tar -C "$project/.agentic" -xf -
+# Only the chosen providers' adapters go to the project (plus the files they share); the kit's own tests and the
+# project.json template stay in the kit (the installer reads the template from here).
+engine_excludes=(--exclude='__pycache__' --exclude='*.pyc' --exclude='./tests' --exclude='./project.json.example')
+for provider_dir in "$KIT"/agentic/providers/*/; do
+  p=$(basename -- "$provider_dir")
+  [[ " $(join ' ' "${providers[@]}") " == *" $p "* ]] || engine_excludes+=(--exclude="./providers/$p")
+done
+tar -C "$KIT/agentic" "${engine_excludes[@]}" -cf - . | tar -C "$project/.agentic" -xf -
 if [[ $had_agentic == true ]]; then changed+=('.agentic/'); else created+=('.agentic/'); fi
 
 # Project configuration.

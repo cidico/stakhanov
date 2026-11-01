@@ -80,8 +80,12 @@ t 'fresh install on main: .agentic/bin/campaign is installed and executable' tes
 t 'fresh install on main: project.json names the project and the main branch' \
   jq -e --arg name fresh-main '.name == $name and .main_branch == "main"' "$repo/.agentic/project.json"
 t 'fresh install on main: no __pycache__ or .pyc is copied' bash -c '[[ -z $(find "$1" \( -name __pycache__ -o -name "*.pyc" \)) ]]' _ "$repo/.agentic"
-t 'fresh install on main: .agentic is the kit, except project.json' \
-  diff -r -x __pycache__ -x '*.pyc' -x project.json "$ROOT/agentic" "$repo/.agentic"
+t 'fresh install on main: .agentic is the kit, except project.json, the kit tests, the template and the other providers' \
+  diff -r -x __pycache__ -x '*.pyc' -x project.json -x tests -x project.json.example -x codex -x grok "$ROOT/agentic" "$repo/.agentic"
+t 'fresh install on main: only the chosen provider adapter and the shared files go to .agentic/providers' \
+  bash -c 'cd "$1/.agentic/providers" && [[ $(ls | tr "\n" " ") == "claude common.sh extract-result.py validate-result.py " ]]' _ "$repo"
+t 'fresh install on main: the kit tests and project.json.example stay in the kit' \
+  bash -c '[[ ! -e $1/.agentic/tests && ! -e $1/.agentic/project.json.example ]]' _ "$repo"
 t 'fresh install on main: provider skills are installed' test -f "$repo/.claude/skills/run-campaign/SKILL.md"
 t 'fresh install on main: only the chosen provider is installed' bash -c '[[ ! -e $1/.codex && ! -e $1/.grok ]]' _ "$repo"
 t 'fresh install on main: tracker equals the template' cmp -s "$TEMPLATE_TRACKER" "$repo/docs/agents/issue-tracker.md"
@@ -209,7 +213,9 @@ inst "$home" --update "$repo"
 t '--update without --providers: succeeds' [ "$RC" -eq 0 ]
 t '--update without --providers: keeps the installed provider' test -f "$repo/.codex/skills/run-campaign/SKILL.md"
 t '--update without --providers: does not add providers found on PATH' bash -c '[[ ! -e $1/.claude && ! -e $1/.grok ]]' _ "$repo"
+t '--update without --providers: the other adapters are not copied' bash -c '[[ -x $1/.agentic/providers/codex/run.sh && ! -e $1/.agentic/providers/claude && ! -e $1/.agentic/providers/grok ]]' _ "$repo"
 inst "$home" --update --providers codex,grok "$repo"
+t '--update with --providers: copies the adapters of the listed ones only' bash -c '[[ -x $1/.agentic/providers/codex/run.sh && -x $1/.agentic/providers/grok/run.sh && ! -e $1/.agentic/providers/claude ]]' _ "$repo"
 t '--update with --providers: installs exactly the listed ones' bash -c '[[ -e $1/.grok/skills/run-campaign && -e $1/.codex/skills/run-campaign ]]' _ "$repo"
 TEST_PATH=$PATH
 

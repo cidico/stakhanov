@@ -8,8 +8,8 @@ documents what the runner enforces so those rules do not have to repeat it.
 ## Configuration
 
 `.agentic/project.json` holds the per-project settings. A missing file means defaults; an invalid one stops
-every command. `project.json.example` is a starting point, and the installer creates the file from it with the
-project name and the detected main branch.
+every command. `project.json.example` (in the kit, not copied to projects) is a starting point, and the installer creates the
+file from it with the project name and the detected main branch.
 
 The effective settings are the main branch's committed copy (`git show <main>:.agentic/project.json`), for
 every command, whether it runs in the main worktree or in a campaign worktree. The local file is read only to

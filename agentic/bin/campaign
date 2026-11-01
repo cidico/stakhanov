@@ -1989,7 +1989,7 @@ cmd_overview() {
 
 cmd_self_test() {
   local test_file="$AGENTIC_DIR/tests/test_campaign.py"
-  [[ -f $test_file ]] || die "self-test unavailable: $test_file"
+  [[ -f $test_file ]] || die "self-test unavailable: $test_file; the kit's tests are not installed in projects, run the self-test from the stakhanov repository (agentic/bin/campaign self-test in a clone of https://github.com/cidico/stakhanov, or its agentic/tests)"
   python3 -m unittest discover -s "$AGENTIC_DIR/tests" -p 'test_*.py'
   bash "$AGENTIC_DIR/tests/provider-adapters.sh"
 }
