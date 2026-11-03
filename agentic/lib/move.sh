@@ -13,12 +13,15 @@ MOVE_EXCLUDES=(--exclude=/worktrees/ --exclude=/agentic/ --exclude=/agentic.stag
   --exclude=/runner.lock --exclude=/launcher.lock --exclude=/launcher.pid --exclude=/state/*.active
   --exclude=/state/*.executor --exclude=/state/supervisor --exclude=/campaign.json)
 
-# PATH SLUG: on the target, its clone at PATH can adopt campaign SLUG (`campaign _adopt --check`).
+# PATH SLUG [task]: on the target, its clone at PATH can adopt campaign SLUG (`campaign _adopt --check`); with a third
+# argument, SLUG is a task, and the kit there has to know tasks (a kit from before them would adopt it as a campaign).
 read -r -d '' MOVE_CHECK <<'SCRIPT' || true
 export PATH="$PATH:$HOME/.local/bin"
 cd -- "$1" 2>/dev/null || { printf 'no clone at %s\n' "$1"; exit 1; }
 grep -q '_adopt' ./.agentic/bin/campaign 2>/dev/null \
   || { printf 'the kit of %s cannot adopt a campaign: pull the main branch there first\n' "$1"; exit 1; }
+[[ -z ${3:-} ]] || grep -q '_task-plan' ./.agentic/bin/campaign 2>/dev/null \
+  || { printf 'the kit of %s does not know tasks: pull the main branch there first\n' "$1"; exit 1; }
 exec ./.agentic/bin/campaign _adopt --check "$2"
 SCRIPT
 
@@ -91,7 +94,9 @@ cmd_move() {
   fi
 
   note "Checking $target..."
-  remote_script "$MOVE_CHECK" "$path" "$slug" >"$fleet_temp/check.out" 2>&1 \
+  local -a check_kind=()
+  [[ ! -f $runtime/plan/task.json ]] || check_kind=(task)
+  remote_script "$MOVE_CHECK" "$path" "$slug" "${check_kind[@]}" >"$fleet_temp/check.out" 2>&1 \
     || die "$target cannot take campaign $slug: $(fleet_reason "$fleet_temp/check.out")"
 
   # From here on nothing relaunches it: not run, not the supervisor.
@@ -157,6 +162,7 @@ cmd_move() {
     git -C "$main_tree" update-ref -d "$ref"
   done
   rm -rf -- "$runtime"
+  fleet_cache_clear
   mkdir -p -- "$(dirname -- "$marker")"
   jq -n --arg slug "$slug" --arg to "$target" --argjson epoch "$((epoch + 1))" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{slug: $slug, moved_to: $to, epoch: $epoch, at: $at}' >"$marker"
@@ -233,13 +239,22 @@ cmd_adopt() {
     [[ ! -d $runtime/worktrees/$name ]] || restore_wip "$runtime/worktrees/$name" "$ref"
     git -C "$REPO_ROOT" update-ref -d "$ref"
   done < <(git -C "$REPO_ROOT" for-each-ref --format='%(refname)' "refs/agentic/move/$slug/")
-  jq -n --arg slug "$slug" --arg tree "$tree" --arg desired "$desired" --argjson epoch "$epoch" --arg from "$from" \
-    '{slug: $slug, branch: "campaign/\($slug)", worktree: $tree, spec: "\($tree)/campaigns/\($slug)/SPEC.md",
-      desired: $desired, epoch: $epoch, moved_from: $from}' >"$runtime/campaign.json"
+  # A task's plan travels with its runtime: it stays a task here.
+  if [[ -f $runtime/plan/task.json ]]; then
+    jq -n --arg slug "$slug" --arg tree "$tree" --arg spec "$runtime/plan/SPEC.md" --arg desired "$desired" \
+      --argjson epoch "$epoch" --arg from "$from" \
+      '{slug: $slug, kind: "task", branch: "campaign/\($slug)", worktree: $tree, spec: $spec,
+        desired: $desired, epoch: $epoch, moved_from: $from}' >"$runtime/campaign.json"
+  else
+    jq -n --arg slug "$slug" --arg tree "$tree" --arg desired "$desired" --argjson epoch "$epoch" --arg from "$from" \
+      '{slug: $slug, branch: "campaign/\($slug)", worktree: $tree, spec: "\($tree)/campaigns/\($slug)/SPEC.md",
+        desired: $desired, epoch: $epoch, moved_from: $from}' >"$runtime/campaign.json"
+  fi
   chmod 600 "$runtime/campaign.json"
   jq -cn --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg from "$from" --argjson epoch "$epoch" \
     '{time: $time, type: "campaign-moved", message: "moved here from \($from) (epoch \($epoch))"}' >>"$runtime/events/campaign.ndjson"
   rm -f -- "$(moved_marker "$slug")"
   rm -rf -- "$staged"
+  fleet_cache_clear
   printf '%s\n' "$tree"
 }

@@ -1,6 +1,6 @@
 ---
 name: finalize-campaign
-description: Validate, integrate, and clean the campaign inferred from the current branch.
+description: Finish a campaign whose tickets are all done. It validates the whole campaign once more, cleans up its planning files, branches and worktrees, and merges it into the main branch by fast-forward. Use when the owner runs /finalize-campaign, or asks to land, merge or close a finished campaign.
 ---
 
 Read the project's instruction files (see `.agentic/project.json`) and `.agentic/FINALIZE-CAMPAIGN.md`, then run

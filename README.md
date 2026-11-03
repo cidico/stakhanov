@@ -1,240 +1,289 @@
 # Stakhanov
 
-A campaign runner for coding agents. You write a spec and a set of tickets; a deterministic supervisor
-(no model of its own) schedules them across parallel workers, validates each ticket, has a fresh reviewer
-check it, and integrates the result into your main branch with a fast-forward. Workers, reviewers and
-diagnosticians are `claude`, `codex` or `grok` processes; any one of them is enough.
+Hand a planned piece of work to AI coding agents and get it back built, checked, reviewed and merged.
+
+Stakhanov is a kit you install into a Git project. It lets coding agents (Claude, Codex or Grok) carry out a
+plan, ticket by ticket, mostly without you. A runner with no model of its own does the bookkeeping, and your
+project's own commands decide whether the work is good.
 
 The name: Alexei Stakhanov was the Soviet miner who cut fourteen times his quota of coal in a single shift.
 Here the agents work the shifts.
 
-## Flow
+## At a glance
+
+| | |
+| --- | --- |
+| **What it does** | Runs a planned piece of work (a *campaign* of *tickets*) through AI agents. Each ticket is built, tested with your commands, reviewed by a second agent and merged. When all tickets are done, one last check lands the result on your main branch. |
+| **When you need it** | The work is bigger than one chat session, it splits into several tickets, and you want it to run for hours without you watching. Or you have a single, well-described job to hand off (a *task*, which is a campaign of one ticket). |
+| **How you use it** | Install it once per project with `install.sh`. Then you work with five slash commands in your agent: `/grilling`, `/to-spec`, `/to-tickets`, `/run-campaign` and `/finalize-campaign`. `/campaign-status` shows the board, and `/campaign-host` is for session mode. |
+
+> [!NOTE]
+> Linux only. You need `git` and at least one agent CLI: `claude`, `codex` or `grok`. The installer can install what
+> is missing.
+
+## The problem it solves
+
+A coding agent works well on one change at a time. A larger job needs more than that: someone must cut it into
+pieces, keep the pieces from colliding, run the tests, ask for a second opinion, retry what fails, and merge the
+results in a safe order. Doing that by hand in one long chat is slow and fragile.
+
+Stakhanov does that bookkeeping with a plain program, not with a model. The program follows fixed rules, so the same
+campaign behaves the same way tomorrow. The agents do only the creative work: writing code and reviewing it.
+
+## Words used here
+
+| Term | Meaning |
+| --- | --- |
+| **Campaign** | A planned piece of work: a written spec and a set of tickets. It has its own branch, `campaign/<slug>`. |
+| **Ticket** | One unit of work with a goal, its dependencies and the commands that prove it is done. |
+| **Worktree** | A separate checkout of the repository in its own folder. Each ticket gets one, so agents never step on each other or on your files. |
+| **Runner** | The program that drives a campaign. It has no model. It starts agents, runs your checks and merges. |
+| **Worker** | A fresh agent process that implements one ticket. |
+| **Reviewer** | A second, fresh agent that reads the result and may only read: it answers `PASS`, `FIX` or `REPLAN`. |
+| **Diagnostician** | An agent that studies why a ticket keeps failing, so the next worker can fix the cause. |
+| **Finalize** | The last step: validate the whole campaign once more, then merge it into your main branch. |
+
+## How a campaign flows
+
+1. **Plan.** You and your agent refine the idea (`/grilling`) and write a spec (`/to-spec`).
+2. **Tickets.** The spec becomes tickets plus a validation plan, the list of commands that prove the work (`/to-tickets`).
+3. **Work.** For each ticket whose dependencies are done, the runner creates a worktree and starts a fresh worker. Tickets that do not touch the same files run in parallel (2 workers by default, up to 3).
+4. **Validation.** Before the worker starts, the runner checks that the ticket's commands fail on the code as it is, so the ticket's tests really prove the change. After the worker, it commits the change and runs the ticket's commands (tests, linters, builds). If a command fails, one repair worker gets a chance.
+5. **Review.** A fresh reviewer reads the change. `PASS` moves on. `FIX` sends concrete findings to one repair worker and then to a new review. `REPLAN` stops the ticket and waits for a person.
+6. **Integration.** The ticket is rebased onto the campaign branch and merged by fast-forward. If it conflicts, a worker resolves the conflict and the ticket is validated and reviewed again.
+7. **Finalize.** When every required ticket is done, the final validation runs once on the whole campaign, the planning files are removed, and the campaign is merged into your main branch by fast-forward.
 
 ```
-/grilling            stress-test the plan with the user (no files written)
-   |
-/to-spec             write the spec, then: campaign init <spec> --slug <name>   (from the main branch)
-   |                 -> branch campaign/<slug> and its worktree
-/to-tickets          tickets + validation.json, committed on the campaign branch; campaign verify
-   |
-/run-campaign        runner: workers -> validation -> review -> integration, in parallel
-   |                 campaign-watch wakes the coordinator only when it is needed
-/finalize-campaign   final validation, cleanup, git merge --ff-only into the main branch
+plan --> tickets --> worker --> validation --> review --> integration --> finalize
+                        ^            |             |
+                        +-- repair, diagnosis, recovery
 ```
 
-`/grilling`, `/to-spec` and `/to-tickets` are Matt Pocock's skills (https://github.com/mattpocock/skills),
-used unmodified. They are not stored in this kit: `install.sh` downloads them from his repository when it
-installs, and only when a skill is missing. `/run-campaign`, `/finalize-campaign` and `/campaign-status` are
-shipped here, for each provider.
+```mermaid
+flowchart TD
+    plan["Plan: the spec"] --> tickets["Tickets and a validation plan"]
+    tickets --> worker["Fresh worker implements one ticket in its own worktree"]
+    worker --> validate{"Do the ticket checks pass?"}
+    validate -->|"no"| repair["One repair worker"]
+    repair --> validate
+    validate -->|"still failing"| blocked["Ticket blocked"]
+    validate -->|"yes"| review{"Fresh reviewer: PASS, FIX or REPLAN?"}
+    review -->|"FIX"| fix["One repair worker, validate again"]
+    fix --> review2{"Second review"}
+    review2 -->|"PASS"| integrate
+    review2 -->|"FIX again"| blocked
+    review -->|"REPLAN"| human["Waits for a person"]
+    review -->|"PASS"| integrate["Rebase onto the campaign branch, fast-forward"]
+    integrate --> done["Ticket done"]
+    blocked --> diagnose["Diagnosis, then a fresh worker applies it, up to 2 times"]
+    diagnose --> worker
+    done --> finalize["Finalize: validate the whole campaign, fast-forward into main"]
+```
 
-Matt's skills publish wherever the tracker configuration tells them to. The kit ships it as an engine file,
-`.agentic/ISSUE-TRACKER.md`, installed (and replaced on every `--update`) with the rest of `.agentic`, so that
-`/to-spec` and `/to-tickets` publish into a campaign instead of into issues. It is exactly the "Other" tracker
-configuration his `/setup-matt-pocock-skills` would write.
+A blocked ticket does not stop the tickets that do not depend on it. The runner pauses only when nothing else can run.
 
-Documents installed with the engine, in `.agentic/`: `README.md` (what the runner enforces, the settings and
-the environment variables), `WORKFLOW.md`, `SPEC.md`, `TICKET.md`, `VALIDATION.md`, `ISSUE-TRACKER.md`,
-`RUN-CAMPAIGN.md`, `FINALIZE-CAMPAIGN.md` and `roles/`.
+> [!NOTE]
+> Runtime state (prompts, results, logs, receipts) lives in a cache folder (`~/.cache/agentic` by default), never in
+> Git. Your repository only receives the work itself.
 
-## Requirements
+## The skills
 
-- Linux. macOS is not supported.
-- `bash`, `git`, `jq`, `python3`, `flock`, `setsid`, `cmp` (diffutils), `curl`, `tar` and the usual coreutils. No ripgrep. The
-  installer installs the missing ones (see below); with `--no-machine-setup` you provide them.
-- At least one provider CLI: `claude`, `codex` or `grok`. The installer installs it when it is missing.
-- Optional: a working user systemd, so the engine runs in the user's `background.slice` and a supervisor relaunches a
-  campaign that should be running after a crash or a reboot.
-- Optional: `ssh` and `rsync`, here and on the other machines, to use remote executors or a fleet (see
-  [Several machines](#several-machines)).
+You drive Stakhanov with slash commands. `/grilling`, `/to-spec` and `/to-tickets` are Matt Pocock's planning skills
+(https://github.com/mattpocock/skills); the installer fetches them. The other four ship with this kit.
+
+```mermaid
+flowchart LR
+    subgraph planning["Plan (Matt Pocock's skills)"]
+        g["/grilling"] --> s["/to-spec"] --> t["/to-tickets"]
+    end
+    subgraph running["Run (this kit)"]
+        r["/run-campaign"] --> f["/finalize-campaign"]
+    end
+    t --> r
+    r -.->|"any time"| st["/campaign-status"]
+    h["/campaign-host"] -.->|"session mode only"| r
+```
+
+**`/run-campaign`** starts the campaign of the branch you are on, or attaches to it if it already runs. It asks how
+you want to run: *interactive* (you follow the events in the session) or *unattended* (the runner keeps going after
+you close the session). Pass `interactive` or `unattended` to skip the question.
+
+**`/finalize-campaign`** finishes a campaign whose tickets are all done. It rebases the campaign onto the main branch
+if that moved, runs the final validation, removes the planning files, merges into the main branch by fast-forward,
+archives the history and deletes the campaign's branches and worktrees. It refuses to start if a required ticket is
+not done, a worker is still running, or Git is in an unsafe state.
+
+**`/campaign-status`** shows a read-only board: every campaign, every campaign queue and every loose worker round on
+this machine and on the other machines of your fleet. Each ticket has an icon for its state, the phase it is in (for
+example implementing, validating or in review), what comes next, and how long it has run.
+
+**`/campaign-host`** is for session mode (below). It turns the Claude session where you run it into the place where
+campaign roles run as background subagents. `/campaign-host stop` ends that.
+
+## Running roles inside your interactive session
+
+Normally the runner starts every role (worker, reviewer, diagnostician) as its own headless `claude -p` process. On a
+Claude subscription, headless traffic is currently metered heavier on the 5-hour usage window than the interactive
+client: public measurements put it at about 1.6x to 3x for the same tokens
+([anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074)). Subagents of an interactive
+session count as that session.
+
+Session mode avoids that. You open one ordinary interactive Claude Code session and run `/campaign-host` in it. The
+runner then leaves each role as a request in a queue on the machine, and that host session runs it as a background
+subagent. Nothing else in the campaign changes: validation, review, integration, retries and finalize work as before.
+
+```mermaid
+flowchart LR
+    subgraph classic["Classic: print mode, the default"]
+        r1["Runner"] -->|"starts one per role"| p1["Headless claude -p process"]
+        p1 -->|"result"| r1
+    end
+```
+
+```mermaid
+sequenceDiagram
+    participant R as Runner
+    participant Q as Queue on the machine
+    participant H as Host session
+    participant A as Background subagent
+    R->>Q: file a request for a role
+    H->>Q: wait for work
+    Q-->>H: new request
+    H->>A: start the worker, reviewer or diagnostician
+    A->>A: do the role's work
+    A->>Q: write the result
+    Q-->>R: result ready
+    R->>R: validate and go on
+```
+
+To use it:
+
+1. Set `"env": {"AGENTIC_CLAUDE_MODE": "session"}` in `.agentic/project.json` and commit it (or export the variable).
+   Set it back to `print` to return to the classic path.
+2. Open `claude` in the project, with permissions that do not prompt, and run `/campaign-host`.
+3. Run `/run-campaign` as usual. Leave the host session open; it only relays requests.
+
+> [!WARNING]
+> Nobody can answer a prompt inside a background subagent, so the host session must run without permission prompts
+> (for example `claude --permission-mode bypassPermissions`). Subagents inherit that. Use a session you dedicate to
+> hosting.
+
+What to expect:
+
+- **No time limit while it works.** A subagent that shows no sign of work for 10 minutes is stopped
+  (`AGENTIC_SESSION_IDLE_SECONDS`, 600 seconds). Signs of work are its transcript growing, and CPU or disk activity of
+  the command it waits on.
+- **If the host dies, the requests wait.** Reopen the session (resume it and run `/campaign-host` again) and
+  interrupted work goes back into the queue. In a terminal, udarnik's `keep` can reopen it automatically when udarnik
+  is installed. T3 Code restarts its own threads, so udarnik leaves those alone.
+- **Without a host, a run waits.** The runner retries until a host session is open.
+- **Claude only.** Codex and Grok roles are not affected.
+
+The technical description is in [`agentic/providers/claude/README.md`](agentic/providers/claude/README.md).
 
 ## Install
 
-```
-./install.sh [--providers claude,codex,grok] [--update [--force]]
-             [--yes] [--no-machine-setup] [--matt-ref REF] <project-dir>
-```
-
-One command prepares the machine, then installs the kit in the project. `<project-dir>` must be the top level
-of a Git work tree.
-
-### Machine setup (runs first)
-
-1. **System commands.** Any of `git`, `jq`, `python3`, `flock`, `setsid`, `cmp`, `curl` and `tar` that is missing (and
-   `npm`, only when a `codex` or `grok` CLI has to be installed) is installed through the package manager found
-   (`pacman`, `apt-get`, `dnf` or `zypper`), with `sudo` unless you are root. The installer prints the exact
-   command and asks `Install? [y/N]` (default no). With no supported package manager, or when you decline, it
-   stops and lists what to install by hand.
-2. **Provider CLIs.** The providers are `--providers`; else those whose CLI is on `PATH`; else `claude`. A
-   missing CLI is installed after the same question: `claude` with its official installer
-   (`curl -fsSL https://claude.ai/install.sh | bash`), `codex` with `npm install -g @openai/codex`, `grok` with
-   `npm install -g @xai-official/grok`. If the command is not on `PATH` afterwards, the installer says which
-   directory to add. It never logs in: at the end it lists the CLIs it installed, which you must open once to
-   sign in.
-3. **Matt Pocock's skills** (`grilling`, `to-spec`, `to-tickets`). For each selected provider, each one that is
-   not found (see the last item below) is installed unmodified from
-   https://github.com/mattpocock/skills at the machine level: `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/` for claude,
-   `~/.codex/skills/` for codex, `~/.grok/skills/` for grok. The archive is downloaded once per run
-   (`https://codeload.github.com/mattpocock/skills/tar.gz/main`; `--matt-ref REF` picks another ref), each skill is
-   located by name and copied whole, and a skill that already exists is never overwritten. No question is asked
-   (user-level files, no `sudo`), and nothing goes into the project. If the download fails, the installer warns
-   and installs the project anyway. His skills are fetched at install time; the kit does not store them.
-
-`--yes` skips the questions of steps 1 and 2. `--no-machine-setup` skips steps 1 to 3 (for CI): the commands
-must already be there, and a missing Matt skill only produces a warning.
-
-### Project install
-
-`<project-dir>` gets this (the project install is the same with or without the machine setup). The installer:
-
-- copies `agentic/` to `<project>/.agentic/` (refuses if it exists, or if it is a symlink; `--update` replaces
-  everything except `project.json`, and refuses while `.agentic` holds files the kit does not ship, unless
-  `--force` deletes them). Only the adapters of the chosen providers go to `.agentic/providers/` (with the files
-  they share: `common.sh`, `extract-result.py`, `validate-result.py`); the kit's own `tests/` and
-  `project.json.example` stay in the kit, so a project that only uses `claude` never receives the `codex` and
-  `grok` adapters;
-- creates `.agentic/project.json` when missing, with the project name and the detected main branch (`main`, else
-  `master`, else the current branch);
-- copies the skills of each provider to `.claude/skills/`, `.codex/skills/` and `.grok/skills/`. Default: every
-  provider whose CLI is on `PATH`, else `claude`; with `--update`, the providers whose skills are already
-  installed;
-- installs the tracker configuration as `.agentic/ISSUE-TRACKER.md`, with the rest of the engine. Earlier kits
-  wrote it into the project as `docs/agents/issue-tracker.md`: an identical copy is deleted (with `docs/agents` and
-  `docs`, when that leaves them empty) and listed under "Removed from the project"; a copy that differs is kept,
-  with a warning that the kit ignores it now;
-- inserts the workflow rules between `<!-- stakhanov:start -->` and `<!-- stakhanov:end -->` in `AGENTS.md`,
-  creating it when missing. Text outside the markers is never touched. `CLAUDE.md` is never touched: Codex and
-  Grok read only `AGENTS.md`, and Claude Code reads it too (if yours does not, add the line `@AGENTS.md` to
-  `CLAUDE.md` yourself). A `## Agent skills` section outside the markers, in `AGENTS.md` or `CLAUDE.md`, conflicts with
-  the block and is reported;
-- looks for `grilling`, `to-spec` and `to-tickets` where Matt's README installs them (`~/.<provider>/skills`,
-  `<project>/.<provider>/skills`, a plugin under `~/.<provider>/plugins`, and `.agents/skills` in the project and
-  in the home directory, where `npx skills add` puts them). That detection decides what the machine setup
-  installs, and afterwards the installer warns "could not confirm skill X" only for a skill that is still missing
-  (the download failed, or `--no-machine-setup`).
-
-The installer never commits. A Claude Code plugin install of Matt's skills names the commands
-`/mattpocock-skills:grilling`, `/mattpocock-skills:to-spec`, and so on, instead of `/grilling` and `/to-spec`.
-
-### Then
-
-1. Edit `.agentic/project.json` if needed (required checks, time zone, archive folder, remote executors). Its `name`
-   is how a fleet knows the project.
-2. Commit `.agentic`, the provider skills and `AGENTS.md` on the main branch (and the removal of an old
-   `docs/agents/issue-tracker.md`, when the installer deleted it: the command it prints includes it).
-   Do this before `/to-spec`: `campaign init` refuses a main branch without the committed kit, because the
-   campaign worktree and the engine come from the committed branch. The same goes for later edits of
-   `project.json`: they apply once committed.
-3. `/grilling` -> `/to-spec` -> `/to-tickets` -> `/run-campaign` -> `/finalize-campaign`.
-
-If you later run `/setup-matt-pocock-skills` in the project, choose the "Other" tracker and let
-it point to `.agentic/ISSUE-TRACKER.md`; do not let it point to a hosted tracker or to `.scratch/`.
-
-## Configuration
-
-The settings (`.agentic/project.json`) and every `AGENTIC_*` environment variable are documented in
-`agentic/README.md`, installed as `.agentic/README.md`. The effective `project.json` is the main branch's
-committed copy.
-
-Claude accounts: `AGENTIC_CLAUDE_ACCOUNTS=udarnik` (or any command with the same `account` subcommands) lets the Claude
-adapter run in the hook's current account and retry once in another one after a usage limit. When every account is
-out of quota, the ticket waits until the first one is back and runs again, without spending an attempt. `campaign
-run` says when the hook is missing or off on the machine, and `fleet join` leaves it as a pending item when it is
-missing there.
-
-## Controlling a campaign
-
-From the campaign's worktree (or from anywhere with `--campaign SLUG`, see below):
+From a copy of this repository:
 
 ```
-campaign status                  tickets, runner, desired state, and where it is: machine, project, worktree
-                                 and the command that opens the provider's CLI in it
-campaign stop                    start no new ticket; the runner stops when the running ones end
-campaign stop --now              stop at once; the next run recovers the interrupted work
-campaign restart [--now]         stop, then run again with the last run's provider, workers and settings
-campaign watch                   wait until the campaign needs its coordinator (campaign-watch)
+./install.sh <project-dir>
 ```
 
-`campaign run` also installs a supervisor for the repository (a systemd user service): a campaign that should be
-running and whose runner went down (a crash, a technical pause, a reboot) is relaunched with its last settings, three
-times at most without progress; one waiting on a human decision, stopped, done or in a queue is left alone.
+`<project-dir>` must be the top level of a Git work tree. The command prepares the machine (missing system commands,
+agent CLIs, Matt Pocock's skills) and then installs the kit in the project:
 
-## Several machines
+- the engine, in `.agentic/`, with its documents and the settings file `.agentic/project.json`;
+- the skills, in `.claude/skills/` (and `.codex/skills/` and `.grok/skills/` for those providers), and for Claude the
+  three role agents in `.claude/agents/`;
+- a block of workflow rules in `AGENTS.md`, between `<!-- stakhanov:start -->` and `<!-- stakhanov:end -->`. The rest
+  of the file is never touched.
 
-Two ways, which combine:
+The installer never commits and never logs in to an agent CLI: open each CLI it installed once to sign in. Later, run
+it with `--update` to refresh the kit.
 
-- **Remote executors** run the workers (and heavy commands) of a campaign whose runner stays on this machine.
-  `executors` in `project.json` lists them; each worker invocation syncs the ticket worktree there and back, and falls
-  back to this machine when the host is unreachable or has no room. `.agentic/bin/offload -- COMMAND` sends one command
-  (a heavy test suite) the same way. `executor/` turns a Linux machine into an executor
-  (`executor/install.sh root@host --config executor.conf`; see `executor/README.md`).
-- **A fleet**: machines that each hold a clone of the project and run whole campaigns of their own. From any of them
-  you see and control every campaign of the project, a campaign moves from one to another with its uncommitted work,
-  and finalize lands it in the main branch of the machine where you run it. Nothing is central: each machine reaches
-  the others over ssh.
+> [!IMPORTANT]
+> Commit the installed files on your main branch before you run `/to-spec`. A campaign starts from the committed kit,
+> and `campaign init` refuses a main branch without it. Edits to `.agentic/project.json` apply once committed too.
 
-### A fleet in practice
+All options, what the machine setup does and the details of each step are in the
+[technical reference](docs/REFERENCE.md#install).
 
-```
-# In a clone of the project (its project.json "name" committed), on the machine you work on:
-.agentic/bin/campaign fleet join big-box --ssh me@10.0.0.22   # clone the project there and make it ready
-.agentic/bin/campaign fleet                                   # the machines, and how their main branches compare
-.agentic/bin/campaign overview --fleet                        # every campaign on every machine (/campaign-status)
+## From an idea to a finished campaign
 
-# A campaign prepared here (/to-spec, /to-tickets) runs on big-box:
-.agentic/bin/campaign move --to big-box --start               # in the campaign's worktree
+| Step | What you do | Command |
+| --- | --- | --- |
+| 1 | Install the kit and commit it on the main branch. | `./install.sh <project-dir>` |
+| 2 | Stress-test the idea. The agent asks you questions; no files are written. | `/grilling` |
+| 3 | Write the spec and create the campaign branch and worktree, from the main branch. | `/to-spec`, then `campaign init <spec> --slug <name>` |
+| 4 | Turn the spec into tickets and a validation plan, committed on the campaign branch. Check them. | `/to-tickets`, then `campaign verify` |
+| 5 | Open your agent in the campaign worktree. `campaign status` prints its path. | `cd <worktree>` |
+| 6 | Start the runner, or attach to it. | `/run-campaign` (or `/run-campaign unattended`) |
+| 7 | Look at progress when you want. | `/campaign-status`, `campaign status` |
+| 8 | Answer the rare decision that needs you, or recover a stuck ticket. | `campaign decide <ticket> <retry\|block\|cancel>`, `campaign recover <ticket>` |
+| 9 | When every required ticket is done, land the campaign. | `/finalize-campaign` |
 
-# From any machine of the fleet:
-.agentic/bin/campaign status  --campaign my-slug
-.agentic/bin/campaign stop    --campaign my-slug [--now]
-.agentic/bin/campaign restart --campaign my-slug
-.agentic/bin/campaign move    --campaign my-slug --to other-box
+The `campaign` command is `.agentic/bin/campaign` in your project.
 
-# Land it in this machine's main branch (it is moved here first):
-.agentic/bin/campaign finalize --campaign my-slug
-```
+> [!TIP]
+> For a long unattended run, `campaign watch` waits until the campaign needs you (a decision, a blocked ticket, a
+> stalled agent or the end) and stays silent otherwise. The agent that coordinates the campaign can use it instead of
+> polling.
 
-- **One file**, the same on every machine: `~/.config/agentic/fleet.json` (machines, their ssh destinations, where
-  each one keeps the project). `fleet join` and `fleet leave` write it everywhere.
-- **`fleet join` leaves the machine ready**: it installs the commands the kit needs and the project's provider CLIs,
-  signs them in (in a terminal), copies the project's local files and runs its setup when the fleet file says so,
-  checks that every machine reaches the others and that the user lingers. It ends with "every command works there" or
-  with the pending items, each with the command that solves it.
-- **Code moves through git**: each clone has the others as remotes named after their machines. No command ever moves
-  a main branch: a clone behind another one is warned, with the `git pull --ff-only <machine> <branch>` to run by hand.
-- **One machine holds a campaign at a time.** `campaign move` stops it there (after the running tickets, or at once
-  with `--now`), carries its branches, its uncommitted work and its history, and the other machine adopts it; the
-  first one keeps a tombstone. Commands with `--campaign` reach it wherever it is, with your `AGENTIC_*` settings.
-- **Trust**: every machine runs commands on the others as their user. Join only machines you trust.
+**One-off tasks.** For a single, well-described job there is a lighter path: write a brief (see `.agentic/TASK.md`)
+and run `campaign task new <brief>`. A task is a campaign of one ticket whose plan is not committed. `campaign task
+accept <name>` validates it and fast-forwards it into the main branch.
 
-Every detail is in `agentic/README.md` ("Fleet", "Moving a campaign", "Stopping, restarting and supervision").
+## FAQ
 
-## Layout
+**Does it commit to my main branch?**
+Not while it works. Each ticket is built on its own branch in its own worktree. Finished tickets merge into the
+campaign branch, `campaign/<slug>`. Your main branch moves only when you run `/finalize-campaign`, and then only by
+`git merge --ff-only` after the final validation, so there is never a merge commit. Stakhanov does not push. The
+installer never commits either.
 
-```
-agentic/        engine, installed as <project>/.agentic/
-  bin/          campaign (the supervisor), campaign-watch, offload (a command on an executor)
-  lib/          shared shell and Python helpers, remote.sh (one executor's steps), remote-run.sh (worker invocations),
-                fleet.sh (the fleet), move.sh (moving a campaign between machines)
-  providers/    claude, codex and grok adapters, RESULT parsing (a project receives only its providers')
-  roles/        worker, reviewer and diagnostician prompts
-  tests/        engine tests, run by `campaign self-test` in the kit (not copied to projects)
-  *.md          the documents listed under Flow
-skills/         /run-campaign, /finalize-campaign and /campaign-status per provider
-templates/      the block inserted into AGENTS.md
-executor/       the executor package, installed on a host with executor/install.sh (never into a project)
-tests/          installer tests
-install.sh
-```
+**What if a worker fails?**
+It depends on the failure.
 
-## Developing the kit
+- A failing check gets one repair worker.
+- A reviewer's `FIX` gets one repair worker and a second review.
+- A ticket that still ends up blocked gets up to two automatic recoveries. The evidence of the last attempt becomes a
+  diagnosis, and a fresh worker applies it.
+- A problem of the machine, such as a missing command or a command that hit its deadline, blocks the ticket without
+  retries. Fix the machine, then run `campaign recover <ticket>`.
+- A question only you can answer (an ambiguous requirement, a changed requirement or a risky destructive step) waits
+  for `campaign decide`.
+- If the runner crashes or the computer reboots, a supervisor restarts a campaign that should be running, when your
+  user has systemd.
+- If a usage limit is hit and you set up several Claude accounts, the call moves to another account; if every account
+  is out, the ticket waits and runs again without spending an attempt.
 
-```
-python3 -m unittest discover -s agentic/tests -p 'test_*.py'   # engine (mock providers, temporary repos)
-bash agentic/tests/provider-adapters.sh                        # adapter arguments and RESULT parsing
-agentic/bin/campaign self-test                                 # both, from the kit (projects do not get agentic/tests)
-bash tests/install.sh                                          # the installer (temporary repos and homes, stubbed network, sudo and package managers)
-bash executor/tests/executor.sh                                # the executor package (stubbed systemd, namespaces, ssh and claude; no root)
-```
+**Can I stop it?**
+Yes. `campaign stop` starts no new ticket and lets the running ones end. `campaign stop --now` stops at once; the next
+run recovers the interrupted work. `campaign restart` stops and runs again with the same settings.
 
-The tests never call a real model: providers are mocks and every repository is temporary. The fleet tests run
-several machines on this one, each with its own home, machine id, cache and fleet file, behind a fake ssh.
+**What runs where?**
+The runner and the agents run on your machine, in worktrees next to your repository. The runner is a shell and Python
+program with no model. Runtime state is in the cache folder, not in Git. If you want, remote executors run the workers
+on other Linux machines, and a fleet lets several machines run whole campaigns and be controlled from any of them (see
+the [reference](docs/REFERENCE.md#several-machines)).
+
+**What does session mode change?**
+Only where the roles run: as background subagents of one interactive Claude session instead of separate `claude -p`
+processes. The campaign itself, its checks and its merges are the same. See [the section above](#running-roles-inside-your-interactive-session).
+
+**Which agents can I use?**
+`claude`, `codex` or `grok`; one is enough. Session mode is for Claude.
+
+**Does it touch my instruction files?**
+The installer adds a marked block to `AGENTS.md` and leaves `CLAUDE.md` alone. Workers may not edit instruction files,
+the `.agentic` folder or the skill folders; the runner rejects a ticket that does, even when the worker committed the change
+itself. A Claude role also cannot edit files through the shell (`sed -i`, redirections) or write to git: it edits with its
+Edit and Write tools, and the runner commits.
+
+## Where to go next
+
+- [`docs/REFERENCE.md`](docs/REFERENCE.md): the technical page. Installer options, machine setup, controlling
+  campaigns, several machines, session mode commands, the layout of this repository and its tests.
+- [`agentic/README.md`](agentic/README.md): the engine reference, installed in projects as `.agentic/README.md`. The
+  settings, every `AGENTIC_*` environment variable, the ticket lifecycle, tasks, executors and the fleet.
+- [`agentic/providers/claude/README.md`](agentic/providers/claude/README.md): the Claude adapter and its session mode.

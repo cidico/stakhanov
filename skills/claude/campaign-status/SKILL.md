@@ -1,12 +1,15 @@
 ---
 name: campaign-status
-description: Show the progress of every campaign and campaign queue of the project, on every machine of its fleet (read-only board).
+description: Show a read-only board of every campaign, campaign queue and loose worker round on this machine and on the other machines of its fleet. It shows which tickets are done, running or stuck, what phase each is in, and what comes next. Use when the owner runs /campaign-status, or asks how the campaigns are going.
 ---
 
 Run `.agentic/bin/campaign overview --fleet --json` from any worktree of the repository. It is read-only
 (it only fetches the other machines' branches) and lists, for this machine and every other machine of the
 project's fleet (`machines`, this one first with `self`), every campaign in its runner cache and every
-campaign queue. Without a fleet it lists this machine alone. Each ticket carries `goal`,
+campaign queue. Without a fleet it lists this machine alone. Each machine also has `rounds`: the worker rounds running there
+outside any campaign (a coordinating session's unattended workers), each with `id`, `repo`, `worktree`, `model`,
+`effort`, `deadline_minutes`, `attempts`, `account`, `started_local_time`, `elapsed_seconds` and `phase` (`running`, or
+`waiting-for-quota` with `waiting_until_local_time`). Each ticket carries `goal`,
 `depends_on`; in-progress tickets add `executor` (`local` or the remote executor running its workers), `started_local_time`, `elapsed_seconds`, `phase`,
 `phase_local_time`, `phase_seconds` and `unblocks` (todo tickets that depend on it, each with `goal`
 and `waits_also`: other unfinished dependencies); blocked/needs-human tickets add `reason`.
@@ -38,11 +41,13 @@ Phases of an in-progress ticket (`phase` → label → next step). Report the la
 | resolving-conflict | 🔀 resolving an integration conflict | validation → review |
 | provider-error | ⚠️ provider error | recovery or runner pause |
 | waiting-for-quota | ⏳ waiting for quota (every account is out; `phase_note` says until when) | runs again when an account is back |
+| waiting-for-slot | ⏳ waiting for a machine slot | runs when a slot frees |
+| checking-base | 🧪 proving the validation fails on the base | implementation |
 
 Any other value: show it as-is with ⚙️.
 
 With more than one machine, group by machine: a heading `🖥️ <name>` (`(this machine)` for `self`), then its
-campaigns and queues as below, or `No campaigns` when it has none. A machine with `reachable` false shows
+campaigns, queues and rounds as below, or `Nothing running` when it has none. A machine with `reachable` false shows
 `📴 unreachable` with its `error` shortened, and its campaigns as last seen (`seen_local_time`, or `never seen`):
 say they may be out of date. With one machine, omit the machine heading.
 
@@ -77,12 +82,24 @@ Layout per campaign:
 Omit empty sections. A campaign with zero tickets in the listing shows only its heading and a short
 note (finalizing, cleaned or not yet planned, judging by the runner state and recent events).
 
+Each campaign has `guards`, the count of reviewer findings that an automatic check (an analyzer, a lint rule, a test, a
+validation command or the runner) could have caught. When it is above 0, add `🛡️ N findings a guard could catch` to the
+campaign heading line and say that `campaign guards` lists them; at 0, show nothing. A machine whose kit is older has no
+`guards`: show nothing.
+
 Per queue: state, current campaign, campaigns already finalized, and its message when it is `waiting`
 or `stopped`.
 
 Show every time in the display zone using `local_time` fields (`HH:MM (dd/mm)`; the zone comes from
 `AGENTIC_DISPLAY_TZ`, then `timezone` in `.agentic/project.json`, then the system zone); never show the raw UTC
 `time`.
+
+Per machine, after its campaigns and queues, the worker rounds in one table, columns
+`| | Round | Repository | Now | Model | Started | Duration |` (headers translated): 🔄 (⏳ when waiting for quota), **id**
+in bold, `repo`, now (`🛠️ running`, with ` · attempt N` when `attempts` is above 1, or `⏳ waiting for quota until
+<waiting_until_local_time>`), the model and effort (e.g. `opus high`), `started_local_time`, `elapsed_seconds` as
+`N min` or `Xh YYmin`. A machine with no campaign, queue or round says `Nothing running`; a board with rounds is never
+reported as idle.
 
 End with what needs the user, if anything, including every entry of `warnings` (a main branch behind or
 diverged from another machine's: show its command; it is pulled by hand). Do not start, stop, recover or finalize anything from this

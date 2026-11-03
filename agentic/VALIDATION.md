@@ -7,6 +7,7 @@ provider-result text is data, never executable code.
 ```json
 {
   "version": 1,
+  "timeout_minutes": 90,
   "tickets": {
     "AUTH-001": {
       "cheap": [["git", "diff", "--check"]],
@@ -17,6 +18,12 @@ provider-result text is data, never executable code.
   "final": [["git", "diff", "--check"]]
 }
 ```
+
+- `timeout_minutes` (integer, 1 to 1440) at the top of the plan is the deadline of every command that sets none; a
+  command written as `{"command": [...], "timeout_minutes": N}` (instead of a plain argv array) has its own. Without
+  either, `AGENTIC_VALIDATION_TIMEOUT_MINUTES` applies, then 120 minutes. An overdue command is stopped with its whole
+  process group (`SIGTERM`, `SIGKILL` 10 s later) and fails with `exitCode` 124 and `timedOut: true` in the receipt.
+  `AGENTIC_VALIDATION_TIMEOUT_SECONDS` overrides all of them (for tests).
 
 - `cheap` (L0/L1), `component` (L2/L3), and `expensive` (ticket-scoped L4) run for that ticket.
   Empty phases mean not applicable. Use behavior tests for product changes.
@@ -30,6 +37,13 @@ provider-result text is data, never executable code.
   base (for example the build, the linter and the full unit suite). `campaign run` refuses to start while one fails,
   and a ticket whose failing command is a baseline command that also fails on the base is reported as
   `base-red` instead of being repaired. Ticket-specific proofs (new tests) never belong in `baseline`.
+- A red phase gets at most `AGENTIC_VALIDATION_REPAIRS` (1) repair workers in one pass of the validation, then the
+  ticket is blocked. A command that is not in the PATH (exit 127 with `command not found`, or one that cannot be
+  started), runs past its deadline or prints one of the `environment_failure_patterns` of `project.json` failed
+  because of the machine: the ticket is blocked as `environment` with no repair. A script or path of the worktree
+  that is missing (`bash infra/check.sh`, `./check.sh`) is a defect of the code and is repaired. A task's `validate`
+  commands run with no shell: use `bash -c '...'` for `&&`, `|`, redirections, `$` and globs (the plan generator
+  refuses them otherwise).
 - Optional plan-level `campaign_expensive` lists campaign-wide L4 argv (full suites, shared HTTP
   matrices, cutovers). It runs only for a ticket that sets `"campaign_expensive": true` or during
   finalization. Copying one of those commands into a ticket's `expensive` array does not authorize it.
@@ -45,3 +59,24 @@ provider-result text is data, never executable code.
   report). Keep reusable artifacts outside Git; reuse depends on compatible functional inputs.
 - Receipts record the operation and outcome as evidence, not authorization. Keep detailed evidence
   sanitized. Secrets belong in protected environment/configuration, never in argv or receipts.
+
+## Validation that fails before the change
+
+A validation that already passes on the base does not prove the change. Before the first worker of a ticket starts, the
+runner runs the ticket's `cheap` commands and then its `component` commands (never the `expensive` ones) on the ticket's
+base commit, in a throwaway worktree, with the same environment, deadlines and process-group handling as any other
+validation, and stops at the first command that fails. At least one must fail.
+
+- A command that fails proves the validation (event `validate-base-proves`, naming what failed and what passed before it).
+  The worker starts.
+- All commands pass, or the ticket has no `cheap` or `component` command: the ticket is refused before any worker runs
+  (event `validate-base-passes`), blocked with "validate already passes on the base: it does not prove the change" and
+  never retried automatically. Fix the validation and run `campaign recover <ticket>`; the check runs again.
+- A command that is not in the PATH, runs past its deadline or prints one of the `environment_failure_patterns` fails
+  because of the machine, not the code: the ticket is blocked as `environment: ... on the base`, as in any validation.
+- `validate_base: skip` with a `validate_base_reason` in the ticket (or the task's brief) skips the check for a validation
+  that cannot fail on the base: a refactor that the existing tests prove, documentation (event `validate-base-skipped`,
+  with the reason). Without them the check runs.
+- The answer is kept in `state/<ticket>.validate-base` for the same base files and the same commands, so a resumed run
+  does not run the check again. A different base (another ticket landed) or a changed plan runs it again.
+- Its receipt is `validation/base/<ticket>.base.json`, apart from the ticket's own receipts.

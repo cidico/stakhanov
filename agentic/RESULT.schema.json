@@ -67,14 +67,24 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "path", "line", "message", "reason", "fix"],
+        "required": ["severity", "path", "line", "message", "reason", "fix", "guard"],
         "properties": {
           "severity": { "type": "string", "enum": ["critical", "major", "minor"] },
           "path": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
           "line": { "anyOf": [{ "type": "integer" }, { "type": "null" }] },
           "message": { "type": "string", "description": "The concrete defect: what is wrong and where." },
           "reason": { "type": "string", "description": "Why it blocks: the acceptance item, SPEC requirement or repository rule it breaks, or the concrete failure it causes." },
-          "fix": { "type": "string", "description": "What the worker must do to correct it and how to prove the correction; a direction, code optional." }
+          "fix": { "type": "string", "description": "What the worker must do to correct it and how to prove the correction; a direction, code optional." },
+          "guard": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "how"],
+            "description": "The automatic check that would have caught this finding so it never comes back; reviewer-only when none can.",
+            "properties": {
+              "kind": { "type": "string", "enum": ["analyzer", "lint", "test", "validate", "executor", "reviewer-only"], "description": "analyzer: a compiler or Roslyn-style rule; lint: a linter rule; test: a unit or behavior test; validate: a command in the ticket's validation plan; executor: a check the runner itself makes; reviewer-only: no automatic check can catch it." },
+              "how": { "type": "string", "description": "One line: the rule, test or command, and what it asserts; for reviewer-only, why no automatic check can." }
+            }
+          }
         }
       }
     },

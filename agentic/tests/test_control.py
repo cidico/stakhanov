@@ -5,7 +5,11 @@ relaunches a campaign that should be running. Mock providers only."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
+import tempfile
 import time
 import unittest
 
@@ -46,6 +50,64 @@ class ControlTests(unittest.TestCase):
 
     def run_campaign(self, *extra):
         return self.repo.command("run", "--provider", "mock", "--mode", "unattended", *extra, cwd=self.repo.worktree)
+
+    def test_run_refuses_a_plan_that_is_not_committed_and_starts_no_engine(self):
+        self.repo.configure([ticket("TST-001")])
+        self.repo.mock_provider()
+        extra = self.repo.worktree / "campaigns" / self.repo.slug / "tickets" / "TST-002.md"
+        extra.write_text(ticket("TST-002"))
+        validation = self.repo.worktree / "campaigns" / self.repo.slug / "validation.json"
+        plan = json.loads(validation.read_text())
+        plan["tickets"]["TST-002"] = plan["tickets"]["TST-001"]
+        validation.write_text(json.dumps(plan))
+        (self.repo.worktree / "campaigns" / self.repo.slug / "codex-effort.json").write_text("{}\n")
+        result = self.repo.command("run", "--provider", "mock", "--mode", "unattended", cwd=self.repo.worktree, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not committed", result.stderr)
+        self.assertIn("campaigns/harness-sample/tickets/TST-002.md", result.stderr)
+        self.assertIn("campaigns/harness-sample/codex-effort.json", result.stderr)
+        self.assertNotIn("TST-001.md", result.stderr)
+        self.assertIn("git add campaigns/harness-sample/", result.stderr)
+        self.assertIn("git commit -m 'docs(agentic):", result.stderr)
+        # No engine: nothing runs, no runner starts, the ticket stays todo.
+        self.assertFalse(self.status()["runner"]["active"])
+        self.assertEqual([], list(Path(self.repo.cache.name).rglob("runner.pid")))
+        self.assertEqual([], list(Path(self.repo.cache.name).rglob("agentic/bin/campaign")))
+        self.assertEqual(self.states(), {"TST-001": "todo", "TST-002": "todo"})
+        self.assertIn("campaigns/harness-sample/validation.json", result.stderr)
+        # Committed, the plan runs; a later change to a committed plan file is refused the same way.
+        self.repo.git("add", ".", cwd=self.repo.worktree)
+        self.repo.git("commit", "-m", "plan", cwd=self.repo.worktree)
+        validation.write_text(validation.read_text() + "\n")
+        result = self.repo.command("run", "--provider", "mock", "--mode", "unattended", cwd=self.repo.worktree, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("campaigns/harness-sample/validation.json", result.stderr)
+
+    def test_run_with_the_plan_committed_goes_on_as_before(self):
+        self.repo.configure([ticket("TST-001")])
+        self.repo.mock_provider()
+        # Work that is not the plan (a scratch file) does not stop the run.
+        (self.repo.worktree / "scratch.txt").write_text("not part of the plan\n")
+        result = self.run_campaign()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.wait(lambda: not self.status()["runner"]["active"], message="the runner to end")
+        self.assertEqual(set(self.states().values()), {"done"})
+
+    def test_finalize_lists_the_files_that_leave_the_worktree_dirty(self):
+        self.repo.configure([ticket("TST-001", status="done")])
+        (self.repo.worktree / "campaigns" / self.repo.slug / "validation.json").write_text("{}\n")
+        (self.repo.worktree / "stray.txt").write_text("x\n")
+        result = self.repo.command("finalize", cwd=self.repo.worktree, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("campaign worktree is dirty", result.stderr)
+        self.assertIn("campaigns/harness-sample/validation.json", result.stderr)
+        self.assertIn("stray.txt", result.stderr)
+        for index in range(25):
+            (self.repo.worktree / f"many-{index:02d}.txt").write_text("x\n")
+        result = self.repo.command("finalize", cwd=self.repo.worktree, check=False)
+        listed = [line for line in result.stderr.splitlines() if line.startswith(("??", " M", "M ", "A "))]
+        self.assertEqual(len(listed), 20)
+        self.assertIn("and 7 more", result.stderr)
 
     def test_stop_lets_the_running_ticket_end_and_starts_no_other(self):
         self.repo.configure([ticket("TST-001", collision=("one",)), ticket("TST-002", collision=("two",))])
@@ -115,6 +177,17 @@ class ControlTests(unittest.TestCase):
         config = json.loads(next(Path(self.repo.cache.name).rglob("run-config.json")).read_text())
         self.assertEqual((config["provider"], config["workers"]), ("mock", 1))
         self.assertEqual(config["env"]["AGENTIC_CLAUDE_EFFORT"], "low")
+
+    def test_the_settings_of_a_run_leave_out_what_belongs_to_the_machine(self):
+        self.repo.configure([ticket()])
+        self.repo.mock_provider()
+        self.repo.env.update(AGENTIC_SLOT="2", AGENTIC_STATE="/machine/state", AGENTIC_CLAUDE_EFFORT="low")
+        self.run_campaign("--workers", "1")
+        self.wait(lambda: not self.status()["runner"]["active"], message="the run to end")
+        env = json.loads(next(Path(self.repo.cache.name).rglob("run-config.json")).read_text())["env"]
+        self.assertEqual(env["AGENTIC_CLAUDE_EFFORT"], "low")
+        self.assertNotIn("AGENTIC_SLOT", env)
+        self.assertNotIn("AGENTIC_STATE", env)
 
     def test_status_overview_and_run_say_where_the_campaign_is_and_how_to_open_it(self):
         self.repo.configure([ticket()])
@@ -215,6 +288,54 @@ class ControlTests(unittest.TestCase):
         self.supervise()
         time.sleep(1)
         self.assertNotIn("supervisor-relaunch", [event["type"] for event in self.events()])
+
+
+class QuotaJitterTests(unittest.TestCase):
+    """The time wait_for_quota gives to the rounds waiting for the same quota gets a random delay."""
+
+    BACK = 4_000_000_000
+    PROVIDER = Path(__file__).resolve().parents[1] / "lib" / "provider.sh"
+
+    def back_times(self, runs, seed, jitter=None):
+        # The stub of desired_state ends each wait at once; the stub of in_display_tz shows the time as epoch seconds.
+        script = r'''
+            source "$1"
+            campaign_slug() { echo slug; }
+            desired_state() { echo stopped; }
+            in_display_tz() { printf '%s' "${3#@}"; }
+            event() { printf '%s\n' "$2"; }
+            printf 'accounts-back-at=%s\n' "$2" > "$3"
+            RANDOM=$4
+            for _ in $(seq "$5"); do wait_for_quota TST-001 "$3" worker || true; done
+        '''
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ)
+            env.pop("AGENTIC_QUOTA_JITTER_SECONDS", None)
+            if jitter is not None:
+                env["AGENTIC_QUOTA_JITTER_SECONDS"] = jitter
+            result = subprocess.run(["bash", "-c", script, "_", str(self.PROVIDER), str(self.BACK),
+                                     str(Path(directory) / "log"), str(seed), str(runs)],
+                                    env=env, text=True, capture_output=True, check=True)
+        found = [int(m.group(1)) for line in result.stdout.splitlines() if (m := re.search(r"waits until (\d+) and", line))]
+        self.assertEqual(len(found), runs)
+        return [value - self.BACK for value in found]
+
+    def test_the_default_delay_is_between_zero_and_120_seconds_and_varies(self):
+        delays = self.back_times(60, seed=7)
+        self.assertTrue(all(0 <= delay <= 120 for delay in delays), delays)
+        self.assertGreater(len(set(delays)), 10)
+
+    def test_a_fixed_seed_gives_the_same_delays(self):
+        self.assertEqual(self.back_times(10, seed=42, jitter="30"), self.back_times(10, seed=42, jitter="30"))
+        self.assertTrue(all(0 <= delay <= 30 for delay in self.back_times(40, seed=3, jitter="30")))
+
+    def test_a_zero_delay_keeps_the_exact_time(self):
+        self.assertEqual(set(self.back_times(5, seed=1, jitter="0")), {0})
+
+    def test_an_invalid_delay_falls_back_to_the_default(self):
+        delays = self.back_times(40, seed=5, jitter="soon")
+        self.assertTrue(all(0 <= delay <= 120 for delay in delays), delays)
+        self.assertGreater(max(delays), 0)
 
 
 if __name__ == "__main__":

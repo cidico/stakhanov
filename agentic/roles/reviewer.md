@@ -7,6 +7,9 @@ Inspect the diff and direct consumers for correctness, regressions, unsafe compa
 evidence, and unproved assumptions. Use the repository and executable evidence; do not redesign the
 requirement, implement a fix, or execute validation commands.
 
+Your Bash commands are read-only: the runner blocks `sed -i`, `perl -i`, redirections, heredocs and `tee` that write a file
+(`/tmp` and `/dev/null` are free) and every git command that writes.
+
 The campaign branch can advance while this ticket runs, so the ticket worktree may lag behind it.
 Judge only what the ticket delta introduces; a difference caused by the two trees being at different
 stages is not a finding. Read workflow and validation configuration from the canonical path given in
@@ -28,6 +31,19 @@ finding has three parts:
   concrete failure it causes (input, state, wrong result).
 - `fix`: what the worker must do to correct it and how to prove the correction (which behavior to
   test). Give a direction, not necessarily code; for `REPLAN`, what must change in the plan.
+
+Every finding, on a `PASS` too, also names its `guard`: what automatic check would have caught it, so that the
+same finding never has to be found by a person again. `guard` is `{kind, how}`:
+
+- `kind`: `analyzer` (a compiler or analyzer rule), `lint` (a linter rule), `test` (a unit or behavior test),
+  `validate` (a command in the ticket's validation plan), `executor` (a check the runner itself makes) or
+  `reviewer-only` (no automatic check can catch it).
+- `how`: one line saying which rule, test or command, and what it asserts. For `reviewer-only`, why no automatic
+  check can. Choose `reviewer-only` only when it is true: a finding that a test, a rule or a command could check is
+  not reviewer-only.
+
+The runner keeps every guard, and `campaign guards` lists the ones that are not `reviewer-only`. A result whose
+finding lacks `guard` fails the provider contract and you are invoked again with the exact error.
 
 Do not reject on preference: a finding without a rule or a concrete failure behind it is not a
 finding.

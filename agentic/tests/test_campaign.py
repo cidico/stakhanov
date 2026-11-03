@@ -25,6 +25,9 @@ KIT = Path(_KIT_ROOT) / "agentic"
 shutil.copytree(HARNESS, KIT, ignore=shutil.ignore_patterns("tests", "__pycache__", "project.json*"))
 CAMPAIGN = KIT / "bin" / "campaign"
 
+# The proxy settings of the machine that runs the tests (any case): the harness takes them out of the environment it gives the kit.
+PROXY_VARIABLES = {"http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy", "rsync_proxy", "socks_proxy"}
+
 SPEC = """\
 # Harness Sample
 
@@ -45,9 +48,13 @@ None.
 """
 
 
-def ticket(ticket_id="TST-001", status="todo", risk="low", dependencies=(), collision=()):
+def ticket(ticket_id="TST-001", status="todo", risk="low", dependencies=(), collision=(), base_check=False):
+    """A sample ticket. Its sample validation (git diff --check) passes on any base, so the ticket says it skips the check
+    that the validation fails on the base, unless base_check asks the engine to make it."""
     deps = "[" + ", ".join(dependencies) + "]"
     domains = "[" + ", ".join(collision) + "]"
+    skip = "" if base_check else "validate_base: skip"
+    why = "" if base_check else "validate_base_reason: the sample validation is a diff check, which passes on any base"
     return textwrap.dedent(f"""\
         ---
         id: {ticket_id}
@@ -55,6 +62,8 @@ def ticket(ticket_id="TST-001", status="todo", risk="low", dependencies=(), coll
         risk: {risk}
         depends_on: {deps}
         collision_domains: {domains}
+        {skip}
+        {why}
         ---
         # Goal
         Produce {ticket_id}.
@@ -153,10 +162,19 @@ class Repo:
         self.root = Path(self.temp.name)
         self.branch = branch
         self.installed = commit_kit
-        # A fleet file of the machine running the tests never reaches them, and no run installs a supervisor there.
+        # A fleet file of the machine running the tests never reaches them, and no run installs a supervisor there. Nor
+        # do its machine slots: the state is the test's own, without a limit unless a test sets one.
         self.env = dict(os.environ, AGENTIC_CACHE=self.cache.name, AGENTIC_FLEET=str(Path(self.cache.name) / "fleet.json"),
-                        AGENTIC_SUPERVISOR="off")
-        self.env.pop("AGENTIC_DISPLAY_TZ", None)
+                        AGENTIC_SUPERVISOR="off", AGENTIC_QUOTA_JITTER_SECONDS="0",
+                        AGENTIC_STATE=str(Path(self.cache.name) / "state"))
+        for name in ("AGENTIC_DISPLAY_TZ", "AGENTIC_SLOTS", "AGENTIC_SLOT"):
+            self.env.pop(name, None)
+        # The proxy of the machine running the tests never reaches the kit: sudo prints it in the commands it is given.
+        for name in list(self.env):
+            if name.lower() in PROXY_VARIABLES:
+                del self.env[name]
+        # Surveys of the fleet ask every time, unless a test is about the cache.
+        self.env.setdefault("AGENTIC_FLEET_CACHE_SECONDS", "0")
         self.git("init", "-b", self.branch)
         self.git("config", "user.email", "agentic@example.test")
         self.git("config", "user.name", "Agentic Test")
@@ -282,16 +300,43 @@ class Repo:
               fi
               printf '%s\n' "$ticket" > "$worktree/product-$ticket.txt"
             fi
+            if [ "$role" = worker ] && [ -n "${MOCK_GRANDCHILD:-}" ]; then
+              # A build server left running: it outlives the worker with every descriptor the worker had.
+              sleep 600 & printf '%s\n' "$!" >> "$MOCK_GRANDCHILD"
+            fi
+            if [ "$role" = worker ] && [ -n "${MOCK_OFFLOAD:-}" ]; then
+              (cd "$worktree" && ./.agentic/bin/offload -- sh -c 'printf "%s\\n" "${AGENTIC_SLOT:-none}" >> "$MOCK_OFFLOAD"')
+            fi
             if [ "$role" = worker ] && [ -n "${MOCK_REPAIR_FILE:-}" ] && echo "$result" | grep -q -- '-repair.json$'; then
               touch "$worktree/$MOCK_REPAIR_FILE"
             fi
             if [ "$role" = worker ] && [ -n "${MOCK_RENAME_FROM:-}" ] && echo "$result" | grep -q -- '-worker.json$'; then
               git -C "$worktree" mv "$MOCK_RENAME_FROM" "$MOCK_RENAME_TO"
             fi
+            if [ "$role" = worker ] && [ "$status" = PASS ] && [ -n "${MOCK_COMMIT:-}" ] && echo "$result" | grep -q -- '-worker.json$'; then
+              # A worker that commits its own change: nothing is left uncommitted for the runner to look at.
+              git -C "$worktree" add -A; git -C "$worktree" commit -q -m "worker commit"
+            fi
             if [ "$role" = worker ] && [ "${MOCK_EXIT_FAIL:-}" = 1 ]; then exit 1; fi
             findings='[]'; [ "$status" = FIX ] && findings='[{"severity":"major","path":null,"line":null,"message":"fix"}]'
             if [ "$role" = reviewer ] && [ "${MOCK_CONCRETE_FIX:-}" = 1 ] && [ ! -f "$worktree/review-fixed" ]; then
-              status=FIX; findings='[{"severity":"major","path":"review-fixed","line":1,"message":"Required output review-fixed is missing.","reason":"Acceptance requires the ticket output file.","fix":"Create review-fixed next to the product file and check that it exists."}]'
+              status=FIX; findings='[{"severity":"major","path":"review-fixed","line":1,"message":"Required output review-fixed is missing.","reason":"Acceptance requires the ticket output file.","fix":"Create review-fixed next to the product file and check that it exists.","guard":{"kind":"test","how":"a test that asserts review-fixed exists next to the product file after the worker round"}}]'
+            fi
+            if [ "$role" = reviewer ] && [ -n "${MOCK_FINDING:-}" ]; then
+              # The review number of this ticket decides: the first review rejects with one finding of the kind MOCK_FINDING
+              # names (no-guard-once: without a guard the first time it is asked, with one the second), the others pass.
+              mkdir -p "$MOCK_FINDING_DIR"
+              reviews=$(( $(cat "$MOCK_FINDING_DIR/$ticket" 2>/dev/null || printf 0) + 1 )); printf '%s' "$reviews" > "$MOCK_FINDING_DIR/$ticket"
+              status=PASS; findings='[]'
+              plain='{"severity":"major","path":"src/rule.txt","line":3,"message":"The refund total drops the tax line.","reason":"Acceptance A12 says the customer gets the whole order total back.","fix":"Add the tax line to the refund total and assert it in a test."}'
+              rule='{"kind":"test","how":"a unit test that refunds an order with tax and asserts the whole total comes back"}'
+              case "${MOCK_FINDING}:$reviews" in
+                no-guard:*|no-guard-once:1) status=FIX; findings="[$plain]" ;;
+                no-guard-once:2|guard:1) status=FIX; findings=$(jq -c --argjson rule "$rule" '[. + {guard: $rule}]' <<<"$plain") ;;
+                reviewer-only:1) status=FIX; findings=$(jq -c '[. + {guard: {kind: "reviewer-only", how: "judging whether the wording of the refund email is kind needs a person"}}]' <<<"$plain") ;;
+                mixed:1) status=FIX; findings=$(jq -c --argjson rule "$rule" '[(. + {guard: $rule}), (. + {severity: "minor", message: "The refund email wording is curt.", guard: {kind: "reviewer-only", how: "tone cannot be asserted by a check"}})]' <<<"$plain") ;;
+                note:1) status=PASS; findings=$(jq -c --argjson rule "$rule" '[. + {severity: "minor", guard: $rule}]' <<<"$plain") ;;
+              esac
             fi
             blocker=null; human_decision=null
             if [ "$role" = worker ] && [ "$status" = BLOCKED ]; then
@@ -791,6 +836,44 @@ class CampaignTests(unittest.TestCase):
         self.assertIn("TST-001", shared); self.assertIn("TST-002", shared)
         self.assertNotRegex(shared, r"(?m)^(<<<<<<<|=======|>>>>>>>)")
         self.assertIn("integration-conflict", [event["type"] for event in self.events()])
+
+    def assert_unmarked_conflict_waits_for_a_person(self, path, seed, attributes=None):
+        """git apply --3way leaves a conflict in a file git merges without markers as the campaign's version: no integration
+        repair may run on it, or the ticket would land without its change, and no automatic recovery can merge it."""
+        (self.repo.root / path).write_bytes(seed)
+        self.repo.git("add", path)
+        if attributes is not None:
+            (self.repo.root / ".gitattributes").write_text(attributes)
+            self.repo.git("add", ".gitattributes")
+        self.repo.git("commit", "-m", f"seed {path}")
+        values = [ticket("TST-001", collision=("a",)), ticket("TST-002", collision=("b",))]
+        self.repo.init_campaign(); self.repo.configure(values); self.repo.mock_provider()
+        self.repo.env.update(MOCK_SHARED_FILE=path, MOCK_SLEEP="0.5", MOCK_TRACK_DIR=str(Path(self.repo.cache.name) / "track-unmarked"))
+        result = self.repo.command("run", "--provider", "mock", cwd=self.repo.worktree, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tickets = {item["id"]: item for item in json.loads(self.repo.command("status", "--json", cwd=self.repo.worktree).stdout)["tickets"]}
+        self.assertEqual(sorted(item["status"] for item in tickets.values()), ["done", "needs-human"])
+        [landed] = [name for name, item in tickets.items() if item["status"] == "done"]
+        [later] = [name for name, item in tickets.items() if item["status"] == "needs-human"]
+        events = [event for event in self.events() if event.get("ticket") == later]
+        [waiting] = [event["message"] for event in events if event["type"] == "ticket-needs-human"]
+        self.assertIn(f"the ticket's delta does not apply on campaign/{self.repo.slug}, where both sides changed files that git "
+                      "merges without conflict markers (binary, or a merge attribute such as -merge), which only a person can "
+                      f"merge: {path};", waiting)
+        self.assertNotIn("recovery-scheduled", [event["type"] for event in events])
+        self.assertEqual((self.repo.worktree / path).read_bytes(), seed + f"{landed}\n".encode())
+        # The later ticket keeps its change in its own commits, and the copy of its delta stays.
+        branch = f"agentic/{self.repo.slug}/{later}"
+        shown = subprocess.run(["git", "-C", str(self.repo.root), "show", f"{branch}:{path}"], capture_output=True, check=True)
+        self.assertEqual(shown.stdout, seed + f"{later}\n".encode())
+        self.assertTrue(next(Path(self.repo.cache.name).rglob(f"state/{later}.conflict.patch")).stat().st_size > 0)
+        self.assertFalse(list(Path(self.repo.cache.name).rglob(f"results/{later}-integration-repair.json")))
+
+    def test_39b_a_binary_file_both_tickets_changed_leaves_the_later_one_to_a_person_with_its_delta(self):
+        self.assert_unmarked_conflict_waits_for_a_person("image.bin", b"PNG\0base\n")
+
+    def test_39c_a_text_file_with_a_merge_attribute_both_tickets_changed_leaves_the_later_one_to_a_person(self):
+        self.assert_unmarked_conflict_waits_for_a_person("shared.txt", b"seed\n", attributes="shared.txt -merge\n")
 
     def test_40_blocked_worker_recovers_automatically_with_diagnosis(self):
         self.repo.init_campaign(); self.repo.configure([ticket()]); self.repo.mock_provider()

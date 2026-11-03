@@ -41,15 +41,73 @@ provider_init() {
   touch -- "$event_file"
 }
 
+# What each provider process cost, one usage file per process (a repeated invocation in another account is a second one).
+provider_usage_files=()
+
+# provider_usage_record <raw output file>: reads the cost of one provider process from its raw output. Never fails.
+provider_usage_record() {
+  local usage_file
+  usage_file="$1.usage.$((${#provider_usage_files[@]} + 1)).json"
+  python3 "$result_extractor" --usage-only "$provider_name" "$1" "$usage_file" || true
+  provider_usage_files+=("$usage_file")
+}
+
+# Prints the usage summed over the recorded processes as a JSON object, or null when none could be read. A count or
+# cost no process reported stays null.
+provider_usage_sum() {
+  python3 - "$provider_name" "${provider_usage_files[@]}" <<'PY' || printf 'null\n'
+import json
+import sys
+
+fields = ("cost_usd", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "num_turns", "duration_ms")
+records = []
+for path in sys.argv[2:]:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        if isinstance(record, dict):
+            records.append(record)
+    except (OSError, ValueError):
+        pass
+if not records:
+    print("null")
+    raise SystemExit
+models = {record["model"] for record in records if record.get("model")}
+total = {"provider": sys.argv[1], "model": models.pop() if len(models) == 1 else None}
+for field in fields:
+    values = [record[field] for record in records if record.get(field) is not None]
+    total[field] = (round(sum(values), 10) if field == "cost_usd" else sum(values)) if values else None
+print(json.dumps(total, separators=(",", ":")))
+PY
+}
+
+# Writes the summed usage next to the result, as <result>.usage.json. A failure is a warning, never a failed call.
+provider_usage_store() {
+  local usage
+  usage=$(provider_usage_sum)
+  rm -f -- "$result_file.usage.json"
+  [[ $usage != null ]] || return 0
+  { printf '%s\n' "$usage" > "$result_file.usage.json.tmp" && mv -f -- "$result_file.usage.json.tmp" "$result_file.usage.json"; } 2>/dev/null ||
+    { rm -f -- "$result_file.usage.json.tmp"; printf '%s usage not recorded: cannot write %s.usage.json\n' "$provider_name" "$result_file" >&2; }
+}
+
 provider_event() {
   local state=$1
   local message=$2
+  local usage=null attempts=0
+  # A finished process, completed or failed, reports what its processes cost.
+  if [[ $state == completed || $state == failed ]] && ((${#provider_usage_files[@]} > 0)); then
+    attempts=${#provider_usage_files[@]}
+    usage=$(provider_usage_sum)
+  fi
   PROVIDER_EVENT_PROVIDER=$provider_name \
   PROVIDER_EVENT_ROLE=$role \
   PROVIDER_EVENT_STATE=$state \
   PROVIDER_EVENT_MESSAGE=$message \
   PROVIDER_EVENT_RUN_ID=$provider_run_id \
   PROVIDER_EVENT_PID=$$ \
+  PROVIDER_EVENT_USAGE=$usage \
+  PROVIDER_EVENT_ATTEMPTS=$attempts \
   python3 - "$event_file" <<'PY'
 import datetime
 import json
@@ -66,6 +124,9 @@ event = {
     "state": os.environ["PROVIDER_EVENT_STATE"],
     "message": os.environ["PROVIDER_EVENT_MESSAGE"],
 }
+if int(os.environ["PROVIDER_EVENT_ATTEMPTS"]) > 0:
+    event["usage"] = json.loads(os.environ["PROVIDER_EVENT_USAGE"])
+    event["attempts"] = int(os.environ["PROVIDER_EVENT_ATTEMPTS"])
 with open(sys.argv[1], "a", encoding="utf-8") as stream:
     stream.write(json.dumps(event, separators=(",", ":")) + "\n")
 PY
@@ -128,6 +189,7 @@ PY
     printf '%s\n' 'Use human_decision only for product ambiguity, requirement change, or destructive risk; never for routine commands or technical failures.'
     printf '%s\n' 'Worker BLOCKED requires a blocker; worker FAILED requires needs_diagnosis=true.'
     printf '%s\n' 'Reviewer FIX or REPLAN: every finding states message (the defect and where), reason (the acceptance item, SPEC requirement or repository rule it breaks, or the concrete failure it causes) and fix (what the worker must do and how to prove it; code optional). FIX needs a critical or major finding; minor findings alone are notes on PASS.'
+    printf '%s\n' 'Reviewer: every finding, on PASS too, names its guard {kind, how}: the automatic check (analyzer, lint, test, validate or executor) that would have caught it so it never comes back, with one line saying which rule, test or command asserts what; reviewer-only, with why, when no automatic check can.'
     printf '%s\n\n' 'Never include credentials, tokens, authorization headers, connection strings, or raw secret values in the result.'
     command cat -- "$prompt_file"
   } > "$destination"
@@ -136,14 +198,19 @@ PY
 provider_finish() {
   local raw_file=$1
   local staged_result
+  # An adapter that ran more than one process recorded each of them; otherwise the raw file is the only one.
+  ((${#provider_usage_files[@]} > 0)) || provider_usage_record "$raw_file"
   staged_result=$(mktemp "$(dirname -- "$result_file")/.result.XXXXXX")
+  # The extractor writes the usage of this raw file beside the staged result; the sum over all processes replaces it.
   if ! python3 "$result_extractor" "$provider_name" "$raw_file" "$staged_result" ||
      ! python3 "$result_validator" "$result_schema" "$role" "$staged_result"; then
-    rm -f -- "$staged_result"
+    rm -f -- "$staged_result" "$staged_result.usage.json"
     provider_event failed 'provider returned an invalid structured result'
     return 65
   fi
+  rm -f -- "$staged_result.usage.json"
   mv -f -- "$staged_result" "$result_file"
+  provider_usage_store
   provider_event completed 'structured result validated'
 }
 

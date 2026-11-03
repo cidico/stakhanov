@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""role-guard ROLE: the PreToolUse hook of the Bash tool for the campaign roles (worker, reviewer, diagnostician).
+
+A role changes files with the Edit and Write tools and leaves git to the runner. This hook reads the hook's JSON on stdin
+and, for a Bash call, exits 2 with a short message on stderr (which reaches the model) when any simple command of the
+command line
+
+  - edits a file in place: sed -i / --in-place (-ni, -i.bak, -Ei...), perl -i (-pi, -0pi...);
+  - writes a file by redirection (>, >>, >|, &>, N>, <>), heredoc output (cat <<EOF > f) or tee, to a path other than
+    /dev/null (and the other /dev/ streams), a file descriptor (2>&1, >&2), /tmp, or the requests folder of the session
+    queue (where a read-only role writes its RESULT);
+  - is a git command that writes: add, commit, checkout, reset, branch -D ... (read git stays free: status, diff, log...).
+
+Everything else, every other tool and a command it cannot parse exit 0 silently: the guard fails open and never crashes.
+It is a guard against the habit of a model, not a sandbox: a program that writes a file by itself is not seen.
+"""
+
+import json
+import os
+import re
+import sys
+
+SENTINEL = "\x00"  # stands for a part of a word whose value is not known before the shell runs (an expansion)
+MAX_DEPTH = 8
+OPERATOR_CHARS = ";&|()<>"
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
+KEYWORDS = {"if", "then", "else", "elif", "while", "until", "do", "{", "!", "function"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "ash"}
+
+EDIT = "use the Edit tool"
+WRITE = "create files with Write and change them with Edit"
+GIT = "the runner commits and integrates; only read git is allowed"
+
+
+class Violation(Exception):
+    def __init__(self, what, advice):
+        super().__init__(what)
+        self.what, self.advice = what, advice
+
+
+# --- The command line: simple commands with their redirections. -----------------------------------------------------
+
+class Simple:
+    def __init__(self):
+        self.words = []
+        self.redirects = []  # (operator, target word)
+
+
+def skip_paren(text, i):
+    """The index after the ')' that closes the '(' before i (quotes, escapes and nested parentheses skipped)."""
+    depth, n = 1, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            i = text.find("'", i + 1)
+            i = n if i < 0 else i + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def skip_brace(text, i):
+    """The index after the '}' that closes the '{' before i."""
+    depth, n = 1, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            i = text.find("'", i + 1)
+            i = n if i < 0 else i + 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def skip_backtick(text, i):
+    """The index after the backtick that closes the one before i."""
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "`":
+            return i + 1
+        i += 1
+    return n
+
+
+def skip_name(text, i):
+    """The index after the $name or $@ (and the other one-character parameters) that starts at text[i]."""
+    follower, j = text[i + 1], i + 2
+    if follower.isalnum() or follower == "_":
+        while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+            j += 1
+    return j
+
+
+class Parser:
+    def __init__(self):
+        self.commands = []
+
+    def sub(self, inner, depth):
+        """A command substitution, a process substitution or any other script inside the command line."""
+        if depth < MAX_DEPTH:
+            self.parse(inner, depth + 1)
+
+    def expansions(self, text, depth):
+        """The command substitutions of text that a shell expands (a heredoc body, a double-quoted string)."""
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            if c == "\\":
+                i += 2
+            elif c == "`":
+                end = skip_backtick(text, i + 1)
+                self.sub(text[i + 1:end - 1], depth)
+                i = end
+            elif text.startswith("$((", i):
+                i = skip_paren(text, i + 2)
+            elif text.startswith("$(", i):
+                end = skip_paren(text, i + 2)
+                self.sub(text[i + 2:end - 1], depth)
+                i = end
+            else:
+                i += 1
+
+    def read_word(self, text, i, depth):
+        """The word at text[i] with its quotes removed (a part not known before the shell runs is SENTINEL), the index
+        after it and whether any part was quoted."""
+        out, n, quoted = [], len(text), False
+        while i < n:
+            c = text[i]
+            if c in " \t\n":
+                break
+            if c in OPERATOR_CHARS:
+                if c in "<>" and text[i + 1:i + 2] == "(":  # <(cmd) and >(cmd)
+                    end = skip_paren(text, i + 2)
+                    self.sub(text[i + 2:end - 1], depth)
+                    out.append(SENTINEL)
+                    i = end
+                    continue
+                break
+            if c == "\\":
+                if text[i + 1:i + 2] == "\n":
+                    i += 2
+                    continue
+                out.append(text[i + 1:i + 2])
+                quoted = True
+                i += 2
+            elif c == "'":
+                end = text.find("'", i + 1)
+                end = n if end < 0 else end
+                out.append(text[i + 1:end])
+                quoted = True
+                i = end + 1
+            elif c == '"':
+                quoted = True
+                i += 1
+                body = []
+                while i < n and text[i] != '"':
+                    d = text[i]
+                    if d == "\\" and text[i + 1:i + 2] in ('"', "\\", "$", "`", "\n"):
+                        if text[i + 1] != "\n":
+                            body.append(text[i + 1])
+                        i += 2
+                    elif d == "`":
+                        end = skip_backtick(text, i + 1)
+                        self.sub(text[i + 1:end - 1], depth)
+                        body.append(SENTINEL)
+                        i = end
+                    elif text.startswith("$((", i):
+                        i = skip_paren(text, i + 2)
+                        body.append(SENTINEL)
+                    elif text.startswith("$(", i):
+                        end = skip_paren(text, i + 2)
+                        self.sub(text[i + 2:end - 1], depth)
+                        body.append(SENTINEL)
+                        i = end
+                    elif d == "$" and text[i + 1:i + 2] == "{":
+                        i = skip_brace(text, i + 2)
+                        body.append(SENTINEL)
+                    elif d == "$" and re.match(r"[A-Za-z_0-9@*#?!$-]", text[i + 1:i + 2] or " "):
+                        i = skip_name(text, i)
+                        body.append(SENTINEL)
+                    else:
+                        body.append(d)
+                        i += 1
+                i += 1
+                out.append("".join(body))
+            elif c == "`":
+                end = skip_backtick(text, i + 1)
+                self.sub(text[i + 1:end - 1], depth)
+                out.append(SENTINEL)
+                i = end
+            elif c == "$":
+                nxt = text[i + 1:i + 2]
+                if text.startswith("$((", i):
+                    i = skip_paren(text, i + 2)
+                    out.append(SENTINEL)
+                elif nxt == "(":
+                    end = skip_paren(text, i + 2)
+                    self.sub(text[i + 2:end - 1], depth)
+                    out.append(SENTINEL)
+                    i = end
+                elif nxt == "{":
+                    i = skip_brace(text, i + 2)
+                    out.append(SENTINEL)
+                elif nxt == "'":  # $'...': escapes are kept as written, which is enough to read a path or a flag
+                    end = i + 2
+                    while end < n and text[end] != "'":
+                        end += 2 if text[end] == "\\" else 1
+                    out.append(text[i + 2:end])
+                    quoted = True
+                    i = end + 1
+                elif nxt == '"':
+                    i += 1
+                elif nxt and (nxt.isalnum() or nxt in "_@*#?!$-"):
+                    i = skip_name(text, i)
+                    out.append(SENTINEL)
+                else:
+                    out.append("$")
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out), i, quoted
+
+    def heredoc_body(self, text, i, heredoc, depth):
+        delimiter, strip, quoted = heredoc
+        n, body = len(text), []
+        while i < n:
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+            line = text[i:end]
+            i = min(end + 1, n)
+            if (line.lstrip("\t") if strip else line) == delimiter:
+                break
+            body.append(line)
+        if not quoted:
+            self.expansions("\n".join(body), depth)
+        return i
+
+    def parse(self, text, depth=0):
+        i, n = 0, len(text)
+        current, heredocs, bracket = Simple(), [], False
+
+        def end_command():
+            nonlocal current
+            if current.words or current.redirects:
+                self.commands.append(current)
+            current = Simple()
+
+        while i < n:
+            c = text[i]
+            if c in " \t":
+                i += 1
+            elif c == "\\" and text[i + 1:i + 2] == "\n":
+                i += 2
+            elif c == "\n":
+                end_command()
+                bracket = False
+                i += 1
+                for heredoc in heredocs:
+                    i = self.heredoc_body(text, i, heredoc, depth)
+                heredocs = []
+            elif c == "#":
+                end = text.find("\n", i)
+                i = n if end < 0 else end
+            elif bracket and c in OPERATOR_CHARS:
+                # Inside [[ ]] the operators are comparisons, not redirections.
+                current.words.append(c)
+                i += 1
+            elif c == "(" and text[i + 1:i + 2] == "(" and not current.words:  # (( arithmetic ))
+                i = skip_paren(text, i + 1)
+            elif c in ";|()" or (c == "&" and text[i + 1:i + 2] != ">"):
+                end_command()
+                i += 1
+            elif c in "<>&" and not (c in "<>" and text[i + 1:i + 2] == "("):
+                i = self.redirection(text, i, current, heredocs, depth, "")
+            else:
+                word, end, quoted = self.read_word(text, i, depth)
+                if end < n and text[end] in "<>" and text[end + 1:end + 2] != "(" and (
+                        (word.isdigit() and not quoted) or re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}", word)):
+                    i = self.redirection(text, end, current, heredocs, depth, word)
+                    continue
+                if word == "[[" and not current.words:
+                    bracket = True
+                elif word == "]]":
+                    bracket = False
+                if end == i:  # nothing was read: never loop
+                    end = i + 1
+                current.words.append(word)
+                i = end
+        end_command()
+
+    def redirection(self, text, i, current, heredocs, depth, fd):
+        """The redirection at text[i]; returns the index after its target."""
+        operator = next(op for op in ("&>>", "&>", ">>", ">|", ">&", ">", "<<<", "<<-", "<<", "<&", "<>", "<")
+                        if text.startswith(op, i))
+        i += len(operator)
+        while i < len(text) and text[i] in " \t":
+            i += 1
+        target, i, quoted = self.read_word(text, i, depth)
+        if operator in ("<<", "<<-"):
+            heredocs.append((target, operator == "<<-", quoted))
+        elif operator in (">&", "<&"):
+            # >&2, 2>&1 and >&- duplicate or close a descriptor; >&file sends both streams to the file.
+            if operator == ">&" and not re.fullmatch(r"[0-9]+-?|-", target):
+                current.redirects.append((operator, target))
+        elif operator in (">", ">>", ">|", "&>", "&>>", "<>") and target:
+            current.redirects.append((operator, target))
+        return i
+
+
+# --- What a simple command does. -----------------------------------------------------------------------------------
+
+def session_requests():
+    """The requests folder of the session queue (lib of providers/claude/session.py): where a role writes its RESULT."""
+    directory = os.environ.get("AGENTIC_SESSION_DIR")
+    if not directory:
+        state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+        directory = os.path.join(state, "agentic-session")
+    return os.path.join(os.path.normpath(directory), "requests")
+
+
+def may_write(path):
+    """True for a target a role may redirect to: the null device and the other standard streams, /tmp, and the requests
+    of the session queue. A name that cannot be known before the shell runs (an expansion) is allowed in those folders
+    only; a path that leaves its folder by '..' is not."""
+    if path in ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero") or re.fullmatch(r"/dev/fd/[0-9]+", path):
+        return True
+    known = path.split(SENTINEL, 1)[0]
+    if not known.startswith("/") or ".." in path.split("/"):
+        return False
+    if SENTINEL not in path:
+        known = os.path.normpath(path)
+    return any(known.startswith(folder + "/") for folder in ("/tmp", session_requests()))
+
+
+def shown(words, limit=60):
+    text = " ".join(word.replace(SENTINEL, "$…") for word in words)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def sed_in_place(args):
+    """True when the arguments of sed ask for an in-place edit. GNU sed reads options anywhere, so all are looked at."""
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--":
+            return False
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            if name == "--in-place":
+                return True
+            if "=" not in arg and name in ("--expression", "--file", "--line-length"):
+                skip_next = True
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            for position, letter in enumerate(arg[1:], 1):
+                if letter == "i":
+                    return True
+                if letter in "efl":  # the rest of the cluster, or the next word, is its argument
+                    skip_next = position == len(arg) - 1
+                    break
+    return False
+
+
+def perl_in_place(args):
+    """True when the switches of perl (the arguments before its script) ask for an in-place edit: -i, -pi, -0pi, -i.bak..."""
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--" or arg == "-" or not arg.startswith("-"):
+            return False
+        if arg.startswith("--"):
+            continue
+        position = 1
+        while position < len(arg):
+            letter = arg[position]
+            position += 1
+            if letter == "i":
+                return True
+            if letter == "0":  # -0 takes its octal or hexadecimal digits
+                match = re.compile(r"x[0-9a-fA-F]*|[0-7]*").match(arg, position)
+                position = match.end()
+            elif letter in "eEI" and position == len(arg):  # the next word is its argument
+                skip_next = True
+            elif letter in "eEMmIxdDFCVA":  # the rest of the cluster is its argument
+                break
+    return False
+
+
+def tee_files(args):
+    files, options_done = [], False
+    for arg in args:
+        if not options_done and arg == "--":
+            options_done = True
+        elif not options_done and arg.startswith("-") and arg != "-":
+            continue
+        else:
+            files.append(arg)
+    return files
+
+
+GIT_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
+GIT_WRITERS = {
+    "add", "rm", "mv", "reset", "rebase", "merge", "commit", "checkout", "switch", "restore", "clean", "push", "pull",
+    "fetch", "cherry-pick", "revert", "am", "update-index", "update-ref", "gc", "prune", "init", "clone", "bisect",
+    "filter-branch", "replace", "repack", "pack-refs", "commit-tree", "write-tree", "read-tree", "checkout-index", "mktag",
+    "mktree", "fast-import", "sparse-checkout",
+}
+
+
+def git_subcommand(args):
+    """(subcommand, its arguments) after git's own options, or (None, [])."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in GIT_VALUE_OPTIONS:
+            i += 2
+        elif arg.startswith("-"):
+            i += 1
+        else:
+            return arg, args[i + 1:]
+    return None, []
+
+
+def short_flags(args):
+    """The letters of the short option clusters of args (-fd gives f and d); long options are returned whole."""
+    flags = set()
+    for arg in args:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            flags.add(arg.split("=", 1)[0])
+        elif arg.startswith("-") and len(arg) > 1:
+            flags.update("-" + letter for letter in arg[1:] if letter.isalpha())
+    return flags
+
+
+def positionals(args):
+    found = []
+    for arg in args:
+        if arg == "--":
+            continue
+        if not arg.startswith("-"):
+            found.append(arg)
+    return found
+
+
+def git_writes(subcommand, args):
+    """True when this git command changes the repository, the index, the work tree or a configuration."""
+    flags = short_flags(args)
+    if subcommand in GIT_WRITERS:
+        return True
+    if subcommand == "stash":
+        return not args or args[0] not in ("list", "show")
+    if subcommand == "apply":
+        return not (flags & {"--check", "--stat", "--numstat", "--summary"}) or "--apply" in flags
+    if subcommand == "tag":
+        if flags & {"-a", "-s", "-f", "-d", "-m", "-F", "-u", "-e", "--annotate", "--sign", "--force", "--delete", "--message",
+                    "--file", "--local-user", "--edit"}:
+            return True
+        listing = flags & {"-l", "-n", "--list", "--contains", "--no-contains", "--points-at", "--merged", "--no-merged",
+                           "-v", "--verify"}
+        return bool(positionals(args)) and not listing
+    if subcommand == "branch":
+        if flags & {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u", "-t", "--delete", "--move", "--copy", "--force",
+                    "--set-upstream-to", "--unset-upstream", "--edit-description", "--track", "--no-track"}:
+            return True
+        listing = flags & {"-l", "--list", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged",
+                           "--points-at"}
+        return bool(positionals(args)) and not listing
+    if subcommand == "worktree":
+        return bool(args) and args[0] != "list"
+    if subcommand == "notes":
+        return bool(args) and positionals(args)[:1] not in (["list"], ["show"], [])
+    if subcommand == "reflog":
+        return bool(positionals(args)) and positionals(args)[0] in ("expire", "delete")
+    if subcommand == "remote":
+        return bool(positionals(args)) and positionals(args)[0] not in ("show", "get-url")
+    if subcommand == "submodule":
+        return bool(positionals(args)) and positionals(args)[0] not in ("status", "summary")
+    if subcommand == "symbolic-ref":
+        return len(positionals(args)) >= 2 or "-d" in flags or "--delete" in flags
+    if subcommand == "hash-object":
+        return "-w" in flags
+    if subcommand == "config":
+        rest, skip = [], False
+        for arg in args:  # the value of an option is not a name
+            if skip:
+                skip = False
+            elif arg in ("-f", "--file", "--blob", "--type", "--default", "--comment"):
+                skip = True
+            else:
+                rest.append(arg)
+        flags, named = short_flags(rest), positionals(rest)
+        if named[:1] and named[0] in ("list", "get"):
+            return False
+        if named[:1] and named[0] in ("set", "unset", "rename-section", "remove-section", "edit"):
+            return True
+        if flags & {"--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "-e", "--edit"}:
+            return True
+        if flags & {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--show-origin", "--show-scope"}:
+            return False
+        return len(named) >= 2  # git config NAME VALUE
+    return False
+
+
+WRAPPERS_WITH_VALUES = {
+    # wrapper: the options that take a value as the next word
+    "command": set(), "builtin": set(), "exec": {"-a"}, "nohup": set(), "setsid": set(), "time": {"-f", "-o", "--format", "--output"},
+    "nice": {"-n", "--adjustment"}, "ionice": {"-c", "-n", "-p", "-P", "-u"}, "stdbuf": {"-i", "-o", "-e"},
+    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U"}, "doas": {"-u", "-C"},
+    "xargs": {"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "-R", "-S", "--arg-file", "--delimiter", "--max-args", "--max-lines",
+              "--max-procs", "--max-chars"},
+    "env": {"-u", "-C", "--unset", "--chdir"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "flock": {"-w", "-E", "--timeout", "--conflict-exit-code"},
+}
+
+
+def unwrap(name, args):
+    """What a wrapper command runs: the words after its own options (and, for timeout and flock, its operand)."""
+    values = WRAPPERS_WITH_VALUES[name]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            i += 1
+            break
+        if name == "env" and ASSIGNMENT.match(arg):
+            i += 1
+        elif name == "command" and arg in ("-v", "-V"):
+            return []  # a lookup, nothing runs
+        elif arg in values:
+            i += 2
+        elif arg.startswith("-") and len(arg) > 1:
+            i += 1
+        else:
+            break
+    rest = args[i:]
+    if name in ("timeout", "flock") and rest:
+        rest = rest[1:]  # the duration, the lock file
+    return rest
+
+
+def shell_script(args):
+    """The script of bash -c SCRIPT (options before -c may be clustered: -ec, -lc), or None."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-o", "+o", "-O", "+O"):
+            i += 2
+            continue
+        if arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith("-") or arg.startswith("+"):
+            i += 1
+            continue
+        return None
+    return None
+
+
+def check_words(words, depth):
+    """Raises Violation when the command that words spell is forbidden."""
+    words = list(words)
+    if words[:1] == ["function"]:
+        words = words[2:]  # function NAME { ...
+    while words and (ASSIGNMENT.match(words[0]) or words[0] in KEYWORDS):
+        words.pop(0)
+    if not words or SENTINEL in words[0]:
+        return
+    name, args = os.path.basename(words[0]), words[1:]
+    if depth >= MAX_DEPTH:
+        return
+    if name in SHELLS:
+        script = shell_script(args)
+        if script is not None:
+            scan(script, depth + 1)
+        return
+    if name == "eval":
+        scan(" ".join(args), depth + 1)
+    elif name in WRAPPERS_WITH_VALUES:
+        if name == "env" and "-S" in args:
+            scan(args[args.index("-S") + 1] if args.index("-S") + 1 < len(args) else "", depth + 1)
+        check_words(unwrap(name, args), depth + 1)
+    elif name == "find":
+        for index, arg in enumerate(args):
+            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                command = []
+                for word in args[index + 1:]:
+                    if word in (";", "+"):
+                        break
+                    command.append(word)
+                check_words(command, depth + 1)
+    elif name in ("sed", "gsed") and sed_in_place(args):
+        raise Violation(f"`{shown(words)}` edits a file in place", EDIT)
+    elif name == "perl" and perl_in_place(args):
+        raise Violation(f"`{shown(words)}` edits a file in place", EDIT)
+    elif name == "tee":
+        for file in tee_files(args):
+            if not may_write(file):
+                raise Violation(f"`{shown(words)}` writes {shown([file], 40)}", WRITE)
+    elif name == "git":
+        subcommand, rest = git_subcommand(args)
+        if subcommand is not None and SENTINEL not in subcommand:
+            if git_writes(subcommand, rest):
+                raise Violation(f"`{shown(words)}` writes to the repository", GIT)
+            for arg in rest:
+                if arg.startswith("--output=") and not may_write(arg.split("=", 1)[1]):
+                    raise Violation(f"`{shown(words)}` writes {shown([arg.split('=', 1)[1]], 40)}", WRITE)
+
+
+def scan(script, depth=0):
+    parser = Parser()
+    parser.parse(script, depth)
+    for command in parser.commands:
+        for operator, target in command.redirects:
+            if not may_write(target):
+                raise Violation(f"`{operator} {shown([target], 40)}` writes a file", WRITE)
+        check_words(command.words, depth)
+
+
+def main():
+    role = sys.argv[1] if len(sys.argv) > 1 else "role"
+    try:
+        data = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return 0
+    if not isinstance(data, dict) or data.get("tool_name") != "Bash":
+        return 0
+    tool_input = data.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str) or not command.strip():
+        return 0
+    try:
+        scan(command)
+    except Violation as violation:
+        print(f"role-guard ({role}): {violation.what}: {violation.advice}.", file=sys.stderr)
+        return 2
+    except Exception:  # an unreadable command line is allowed: the guard never gets in the way of a role by mistake
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

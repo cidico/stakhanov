@@ -8,7 +8,7 @@ from test_campaign import Repo, ticket, CAMPAIGN
 
 class PlanRecoveryTests(unittest.TestCase):
     def review_state(self, repo, worker):
-        source = CAMPAIGN.read_text()
+        source = (CAMPAIGN.parent.parent / "lib" / "engine.sh").read_text()
         helper = source.split("review_worktree_state() {", 1)[1].split("\nreview_ticket() {", 1)[0]
         script = "review_worktree_state() {" + helper + '\nREPO_ROOT=$1\ncampaign_slug() { printf harness-sample; }\nreview_worktree_state "$2"\n'
         return subprocess.run(["bash", "-c", script, "review-state", str(repo.worktree), str(worker)],

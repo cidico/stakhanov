@@ -5,6 +5,10 @@ scoped, as named in the prompt), the ticket, the SPEC, and relevant direct consu
 and run focused local checks. Leave the ticket's planned expensive commands to ticket validation so
 they do not run twice.
 
+Create files with the Write tool and change them with the Edit tool, never through the shell: the runner blocks a Bash
+command that edits a file in place (`sed -i`, `perl -i`) or writes one (a redirection, a heredoc, `tee`; `/tmp` and
+`/dev/null` are free) and every git command that writes. Read git is free.
+
 Do not change requirements, commit, or integrate. Return the canonical RESULT with changed files and
 concrete validation evidence. Set `needs_diagnosis` only when a failure stays obscure after a real
 attempt; it requests help and authorizes nothing.

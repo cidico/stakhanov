@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""session-host: the host side of the claude session mode (AGENTIC_CLAUDE_MODE=session).
+
+An interactive claude session that registers as a host runs the campaign roles as background subagents instead of
+`claude --print` processes. The /campaign-host skill drives this command:
+
+  session-host register              register the calling claude session as a host of this machine
+  session-host unregister            remove its registration
+  session-host wait                  block until there is work for this host; prints `new ID` and `cancel ID AGENT_ID` lines
+  session-host brief ID              print the fields to pass to the Agent tool for request ID, as JSON
+  session-host claim ID AGENT_ID     record the subagent that runs request ID
+  session-host cancelled ID          record that the subagent of request ID was stopped
+  session-host status                hosts and requests of this machine
+
+The queue is machine-level: $AGENTIC_SESSION_DIR, default ${XDG_STATE_HOME:-~/.local/state}/agentic-session. The adapter
+side is providers/claude/session.sh; both share providers/claude/session.py.
+
+Exit status: 0 done, 1 failed, 2 usage, 3 not available (the request is gone, was taken by another host or is not pending).
+"""
+
+import glob
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "providers", "claude"))
+try:
+    import session as queue
+except ImportError:
+    print("session-host: the claude provider is not installed in this .agentic (providers/claude/session.py is missing)",
+          file=sys.stderr)
+    raise SystemExit(1)
+
+EXIT_UNAVAILABLE = 3
+HOST_POLL_SECONDS = 3.0
+
+
+def fail(message, status=1):
+    print("session-host: " + message, file=sys.stderr)
+    raise SystemExit(status)
+
+
+def number_from_env(name, default):
+    try:
+        value = float(os.environ.get(name, ""))
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def config_dir(pid):
+    """The account of a claude process: its CLAUDE_CONFIG_DIR, else ~/.claude."""
+    explicit = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not explicit:
+        try:
+            with open("/proc/%d/environ" % pid, "rb") as stream:
+                for item in stream.read().split(b"\0"):
+                    if item.startswith(b"CLAUDE_CONFIG_DIR="):
+                        explicit = item.split(b"=", 1)[1].decode("utf-8", "replace")
+        except OSError:
+            pass
+    return os.path.abspath(os.path.expanduser(explicit or "~/.claude"))
+
+
+def calling_claude():
+    pid = queue.find_claude()
+    if pid is None:
+        fail("this command must run inside a claude session (no claude process among its ancestors)")
+    return pid
+
+
+def registered_host():
+    pid = calling_claude()
+    host = queue.host_of(pid)
+    if host is None or not host["alive"]:
+        fail("this session is not registered as a host; run `session-host register`")
+    return host
+
+
+def account_name(path):
+    name = os.path.basename((path or "").rstrip("/"))
+    return name[1:] if name.startswith(".") else name
+
+
+def supports(executable, word):
+    try:
+        output = subprocess.run([executable, "--help"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return re.search(r"(?m)^\s*%s\b" % re.escape(word), output.stdout + output.stderr) is not None
+
+
+def udarnik(word, session_id):
+    """`udarnik keep|unkeep SESSION` when the takeover tool is installed and knows the subcommand; a failure is ignored."""
+    executable = shutil.which("udarnik")
+    if not executable or not supports(executable, word):
+        return
+    try:
+        subprocess.run([executable, word, session_id], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# ---------------------------------------------------------------------------------------------------------
+
+def command_register(_args):
+    pid = calling_claude()
+    account = config_dir(pid)
+    registry = os.path.join(account, "sessions", "%d.json" % pid)
+    info = queue.read_json(registry)
+    if not isinstance(info, dict) or not info.get("sessionId"):
+        fail("no session registry entry for the claude process %d (%s)" % (pid, registry))
+    start = queue.proc_start(pid)
+    if info.get("procStart") not in (None, start):
+        fail("the registry entry %s belongs to another process" % registry)
+    previous = queue.host_of(pid)
+    queue.write_json(os.path.join(queue.hosts_dir(), "%d.json" % pid), {
+        "pid": pid,
+        "start": start,
+        "session_id": info["sessionId"],
+        "account": account,
+        "cwd": info.get("cwd") or os.getcwd(),
+        "cgroup": queue.cgroup_of(pid),
+        "machine": socket.gethostname(),
+        "since": (previous or {}).get("since") or int(time.time()),
+    })
+    requeued = queue.prune()
+    # Only a terminal session is brought back by udarnik. An app (T3 Code: entrypoint t3-code) hosts and restarts its own
+    # sessions; udarnik resuming it too would run the same session twice.
+    if (info.get("entrypoint") or "cli") == "cli":
+        udarnik("keep", info["sessionId"])
+    else:
+        print("not kept by udarnik: the session is hosted by %s, which restarts it" % info.get("entrypoint"))
+    print("registered pid=%d session=%s account=%s hosts=%d requeued=%d"
+          % (pid, info["sessionId"], account_name(account), len(queue.live_hosts()), requeued))
+    return 0
+
+
+def command_unregister(_args):
+    pid = calling_claude()
+    host = queue.host_of(pid)
+    session_id = (host or {}).get("session_id")
+    for other in queue.load_hosts():
+        if other["pid"] == pid or (session_id and other.get("session_id") == session_id):
+            try:
+                os.unlink(other["path"])
+            except OSError:
+                pass
+    if session_id:
+        udarnik("unkeep", session_id)
+    print("unregistered pid=%d" % pid)
+    return 0
+
+
+def work_for(host):
+    """The items a host has to act on: cancels first (subagents to stop), then new requests."""
+    cancels, news = [], []
+    for folder, request in queue.request_folders():
+        identifier = os.path.basename(folder)
+        assigned = queue.read_json(os.path.join(folder, "assigned"))
+        mine = (isinstance(assigned, dict) and assigned.get("host_pid") == host["pid"]
+                and assigned.get("session_id") == host["session_id"])
+        if mine and not queue.has(folder, "cancelled") and not queue.has(folder, "done") and (
+                queue.has(folder, "cancel") or not queue.adapter_alive(request)):
+            cancels.append("cancel %s %s" % (identifier, assigned.get("agent_id", "")))
+            continue
+        state = queue.request_state(folder, request)
+        reserved = queue.reservation(folder)
+        if state == "reserved" and reserved and reserved.get("host_pid") != host["pid"]:
+            continue
+        if state in ("pending", "orphaned", "reserved") and not limited_for(folder, host):
+            news.append("new " + identifier)
+    return cancels + news
+
+
+def limited_for(folder, host):
+    text = queue.read_text(os.path.join(folder, "limited")) or ""
+    return host["account"] in text.split("\n")
+
+
+def command_wait(_args):
+    host = registered_host()
+    poll = number_from_env("AGENTIC_SESSION_HOST_POLL_SECONDS", HOST_POLL_SECONDS)
+    queue.prune()
+    rounds = 0
+    while True:
+        if queue.host_of(host["pid"]) is None:
+            print("stopped")
+            return 0
+        items = work_for(host)
+        if items:
+            print("\n".join(items))
+            return 0
+        rounds += 1
+        if rounds % 20 == 0:
+            queue.prune()
+        time.sleep(poll)
+
+
+def request_folder(identifier):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", identifier or "") or identifier.startswith("."):
+        fail("invalid request id: %s" % identifier, 2)
+    folder = os.path.join(queue.requests_dir(), identifier)
+    request = queue.read_json(os.path.join(folder, "request.json"))
+    if not isinstance(request, dict):
+        fail("request %s is gone" % identifier, EXIT_UNAVAILABLE)
+    return folder, request
+
+
+def reserve(folder, host):
+    """Takes the request for this host before the subagent starts, so two hosts do not run the same role: an exclusive
+    link wins; a stale reservation (its host died or it is older than the reservation time) is replaced."""
+    path = os.path.join(folder, "reserved")
+    temporary = os.path.join(folder, ".reserved.%d" % os.getpid())
+    queue.write_json(temporary, {"host_pid": host["pid"], "host_start": host["start"], "session_id": host["session_id"],
+                                 "at": int(time.time())})
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        current = queue.reservation(folder)
+        if current is not None and current.get("host_pid") != host["pid"]:
+            os.unlink(temporary)
+            fail("request is reserved by another host", EXIT_UNAVAILABLE)
+        os.replace(temporary, path)
+        return
+    os.unlink(temporary)
+
+
+REDISPATCH = ("A previous attempt of this role was interrupted. Any uncommitted change in the worktree is its partial, "
+              "unverified work: compare it with the ticket's Acceptance, finish what is missing and remove anything the "
+              "ticket does not ask for.")
+
+
+def brief_prompt(request, folder):
+    role = request["role"]
+    writer = "with Bash (for example cat > FILE <<'EOF')" if request.get("read_only") else "with the Write tool"
+    lines = [
+        "You are a campaign %s subagent. There is no human to ask: decide on your own and finish." % role,
+        "Read %s and do exactly what it says. Where it asks you to return the structured result as your final message, "
+        "do what is written below instead." % request["prompt"],
+        "Work in %s: start every command there (cd first) and keep file paths inside it, except the campaign files the "
+        "prompt names." % request["worktree"],
+        "Write the final RESULT as JSON valid against %s to %s %s, and only then create the empty file %s (touch)."
+        % (request["schema"], request["result"], writer, request.get("done") or os.path.join(folder, "done")),
+        "Never end while a command you started is still running. Run a command that may take more than 3 minutes in the "
+        "background (run_in_background) and wait for it with short checks before you finish.",
+        'Finish with the one-line final message "done %s" and nothing else.' % request["id"],
+    ]
+    if queue.read_text(os.path.join(folder, "dispatches")):
+        lines.insert(0, REDISPATCH)
+    return "\n".join(lines)
+
+
+def command_brief(args):
+    host = registered_host()
+    folder, request = request_folder(args.id)
+    state = queue.request_state(folder, request)
+    if state not in ("pending", "orphaned", "reserved"):
+        fail("request %s is %s" % (args.id, state), EXIT_UNAVAILABLE)
+    if limited_for(folder, host):
+        fail("request %s is waiting for a host in another account" % args.id, EXIT_UNAVAILABLE)
+    reserve(folder, host)
+    model = queue.model_alias(request.get("model"))
+    if model is None:
+        fail("model %s cannot run as a subagent (use opus, sonnet, haiku or fable)" % request.get("model"))
+    role = request["role"]
+    words = re.findall(r"[A-Za-z0-9._-]+", str(request.get("ticket", "")))[:3]
+    print(json.dumps({
+        "subagent_type": "campaign-" + role,
+        "model": model,
+        "effort": request.get("effort"),
+        "description": " ".join([role] + words),
+        "run_in_background": True,
+        "prompt": brief_prompt(request, folder),
+    }, separators=(",", ":")))
+    return 0
+
+
+def command_claim(args):
+    host = registered_host()
+    folder, _request = request_folder(args.id)
+    assigned = queue.read_json(os.path.join(folder, "assigned"))
+    if queue.assigned_alive(assigned) and assigned.get("host_pid") != host["pid"]:
+        fail("request %s is running in another host" % args.id, EXIT_UNAVAILABLE)
+    agent_id = re.sub(r"\.jsonl$", "", re.sub(r"^agent-", "", args.agent_id))
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", agent_id):
+        fail("invalid agent id: %s" % args.agent_id, 2)
+    pattern = os.path.join(glob.escape(host["account"]), "projects", "*", glob.escape(host["session_id"]),
+                           "subagents", "agent-%s.jsonl" % agent_id)
+    matches = glob.glob(pattern)
+    queue.write_json(os.path.join(folder, "assigned"), {
+        "host_pid": host["pid"],
+        "host_start": host["start"],
+        "session_id": host["session_id"],
+        "account": host["account"],
+        "agent_id": agent_id,
+        "transcript": matches[0] if matches else pattern,
+        "at": int(time.time()),
+    })
+    with open(os.path.join(folder, "dispatches"), "a", encoding="utf-8") as stream:
+        stream.write("%d %d\n" % (int(time.time()), host["pid"]))
+    try:
+        os.unlink(os.path.join(folder, "reserved"))
+    except OSError:
+        pass
+    print("claimed %s %s" % (args.id, agent_id))
+    return 0
+
+
+def command_cancelled(args):
+    folder, _request = request_folder(args.id)
+    queue.write_json(os.path.join(folder, "cancelled"), {"at": int(time.time())})
+    print("cancelled " + args.id)
+    return 0
+
+
+def command_status(_args):
+    now = time.time()
+    hosts = queue.load_hosts()
+    requests = queue.request_folders()
+    print("hosts=%d requests=%d" % (len(hosts), len(requests)))
+    for host in hosts:
+        print("host pid=%d alive=%s session=%s account=%s machine=%s age=%ds" % (
+            host["pid"], "yes" if host["alive"] else "no", host.get("session_id", ""), account_name(host.get("account")),
+            host.get("machine", ""), int(now - (host.get("since") or now))))
+    for folder, request in requests:
+        print("request %s %s age=%ds role=%s ticket=%s project=%s attempt=%s" % (
+            os.path.basename(folder), queue.request_state(folder, request), int(now - (request.get("created") or now)),
+            request.get("role", ""), request.get("ticket", ""), request.get("project", ""), request.get("attempt", 1)))
+    return 0
+
+
+def main(argv):
+    commands = {
+        "register": (command_register, 0), "unregister": (command_unregister, 0), "wait": (command_wait, 0),
+        "brief": (command_brief, 1), "claim": (command_claim, 2), "cancelled": (command_cancelled, 1),
+        "status": (command_status, 0),
+    }
+    if not argv or argv[0] not in commands or len(argv) - 1 != commands[argv[0]][1]:
+        print(__doc__.split("\n\n")[0] + "\n\n" + "\n".join(
+            line for line in __doc__.splitlines() if line.startswith("  session-host")), file=sys.stderr)
+        return 2
+
+    class Arguments:
+        pass
+
+    args = Arguments()
+    names = {"brief": ["id"], "claim": ["id", "agent_id"], "cancelled": ["id"]}.get(argv[0], [])
+    for name, value in zip(names, argv[1:]):
+        setattr(args, name, value)
+    return commands[argv[0]][0](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

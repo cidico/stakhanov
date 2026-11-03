@@ -10,8 +10,9 @@ meaningfully increases confidence in the change.
 ## Work routing
 
 Read [`.agentic/WORKFLOW.md`](.agentic/WORKFLOW.md) before substantial implementation. It selects one of
-three modes: `direct`, `ticket`, or `campaign`.
+three modes: `direct`, `task`, or `campaign`.
 
+- Read [`.agentic/TASK.md`](.agentic/TASK.md) when writing a task brief.
 - Read [`.agentic/SPEC.md`](.agentic/SPEC.md) when creating or changing a campaign specification.
 - Read [`.agentic/TICKET.md`](.agentic/TICKET.md) when creating or changing campaign tickets.
 - Read [`.agentic/VALIDATION.md`](.agentic/VALIDATION.md) when defining executable campaign proof.

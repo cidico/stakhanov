@@ -1,6 +1,6 @@
 ---
 name: run-campaign
-description: Run or attach to the campaign inferred from the current branch.
+description: Start the runner of the campaign (the planned set of tickets) on the current campaign/<slug> branch, or attach to it if it already runs. The runner hands each ticket to a fresh AI worker, validates, reviews and merges it, mostly unattended. Use when the owner runs /run-campaign, or asks to start, resume or follow a campaign.
 ---
 
 Read the project's instruction files (see `.agentic/project.json`) and `.agentic/RUN-CAMPAIGN.md`, then follow that procedure with provider

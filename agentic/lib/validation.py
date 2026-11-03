@@ -6,9 +6,16 @@ import json
 import os
 import re
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+
+DEFAULT_TIMEOUT_MINUTES = 120
+MAX_TIMEOUT_MINUTES = 1440
+KILL_GRACE_SECONDS = 10
+TIMEOUT_EXIT_CODE = 124
 
 SECRET_REPLACE = re.compile(
     r"(?i)([Aa]uthorization:\s*(?:Bearer|Basic)\s+)\S+|"
@@ -33,16 +40,69 @@ def argv(value):
     return value
 
 
+def timeout_minutes_value(value, where):
+    """A deadline in minutes: an integer from 1 to MAX_TIMEOUT_MINUTES (a boolean is not one)."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_TIMEOUT_MINUTES:
+        raise ValueError(f'{where} must be an integer from 1 to {MAX_TIMEOUT_MINUTES} (minutes)')
+    return value
+
+
+def entry_argv(entry):
+    """The argv of a plan command, which is an array or {"command": [...], "timeout_minutes": N}."""
+    if isinstance(entry, dict):
+        extra = sorted(set(entry) - {'command', 'timeout_minutes'})
+        if extra:
+            raise ValueError(f'validation command object has unknown field(s): {", ".join(map(str, extra))}')
+        return argv(entry.get('command'))
+    return argv(entry)
+
+
+def entry_timeout_minutes(entry):
+    """The command's own deadline in minutes, or None."""
+    if isinstance(entry, dict) and 'timeout_minutes' in entry:
+        return timeout_minutes_value(entry['timeout_minutes'], 'validation command timeout_minutes')
+    return None
+
+
 def commands(value):
     if not isinstance(value, list):
         raise ValueError('validation phase must be an array')
     for command in value:
-        argv(command)
+        entry_argv(command)
+        entry_timeout_minutes(command)
     return value
 
 
 def argv_key(command):
-    return tuple(command)
+    return tuple(entry_argv(command))
+
+
+def env_text(name):
+    value = os.environ.get(name)
+    return value.strip() if value and value.strip() else None
+
+
+def deadline_seconds(entry, plan):
+    """The deadline of a command, in seconds. First that applies: AGENTIC_VALIDATION_TIMEOUT_SECONDS (for tests), the
+    command's timeout_minutes, the plan's timeout_minutes, AGENTIC_VALIDATION_TIMEOUT_MINUTES, 120 minutes."""
+    override = env_text('AGENTIC_VALIDATION_TIMEOUT_SECONDS')
+    if override is not None:
+        try:
+            seconds = float(override)
+        except ValueError:
+            seconds = 0
+        if not seconds > 0 or seconds == float('inf'):
+            raise ValueError('AGENTIC_VALIDATION_TIMEOUT_SECONDS must be a positive number of seconds')
+        return seconds
+    minutes = entry_timeout_minutes(entry)
+    if minutes is None and isinstance(plan, dict) and 'timeout_minutes' in plan:
+        minutes = timeout_minutes_value(plan['timeout_minutes'], 'validation plan timeout_minutes')
+    if minutes is None:
+        text = env_text('AGENTIC_VALIDATION_TIMEOUT_MINUTES')
+        if text is not None:
+            minutes = timeout_minutes_value(int(text) if re.fullmatch(r'[0-9]+', text) else text,
+                                            'AGENTIC_VALIDATION_TIMEOUT_MINUTES')
+    return (DEFAULT_TIMEOUT_MINUTES if minutes is None else minutes) * 60
 
 
 def campaign_expensive_commands(plan):
@@ -73,6 +133,9 @@ def select_commands(plan, item, phase):
                 selected.append(command)
                 seen.add(key)
         return selected
+    if phase == 'base':
+        # What proves a ticket cheaply: its cheap and component commands. The expensive ones are never discovery.
+        return list(commands(item.get('cheap'))) + list(commands(item.get('component')))
     declared = commands(item.get(phase))
     if phase != 'expensive':
         return declared
@@ -116,6 +179,8 @@ def plan_read(path):
     plan = json.loads(path.read_text())
     if plan.get('version') != 1 or not isinstance(plan.get('tickets'), dict):
         raise ValueError('invalid validation plan version or tickets')
+    if 'timeout_minutes' in plan:
+        timeout_minutes_value(plan['timeout_minutes'], 'validation plan timeout_minutes')
     # Legacy layout (accepted, not produced): without a final list, the campaign_expensive list is the final one.
     if plan.get('final') is None and plan.get('campaign_expensive') is not None:
         plan['final'] = plan['campaign_expensive']
@@ -137,18 +202,25 @@ def plan_read(path):
     return plan
 
 
-def command_record(command, exit_code, started, finished, stdout, stderr, stdout_log, stderr_log):
+def minutes_text(seconds):
+    return f'{seconds / 60:g}'
+
+
+def command_record(command, exit_code, started, finished, stdout, stderr, stdout_log, stderr_log,
+                   timeout_seconds=None, timed_out=False):
     combined = f'{stdout or ""}\n{stderr or ""}'
     tests = failed_tests(combined)
     duration_ms = max(0, int((finished - started).total_seconds() * 1000))
     summary = f'exit {exit_code}'
-    if tests:
+    if timed_out:
+        summary = f'timed out after {minutes_text(timeout_seconds)} min'
+    elif tests:
         summary = f'exit {exit_code}; {len(tests)} failed test line(s)'
     elif exit_code == 0:
         summary = 'exit 0'
     tail = sanitize_text('\n'.join(combined.splitlines()[-12:]))[:2000]
-    return {
-        'command': [sanitize_text(part) for part in command],
+    record = {
+        'command': [sanitize_text(part) for part in entry_argv(command)],
         'exitCode': exit_code,
         'startedAt': started.replace(tzinfo=datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
         'finishedAt': finished.replace(tzinfo=datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
@@ -159,6 +231,10 @@ def command_record(command, exit_code, started, finished, stdout, stderr, stdout
         'failedTests': tests,
         'tail': tail,
     }
+    if timeout_seconds is not None:
+        record['timeoutSeconds'] = timeout_seconds
+        record['timedOut'] = timed_out
+    return record
 
 
 def git_text(tree, *args):
@@ -192,7 +268,7 @@ def reusable_evidence(path, tip, dirty):
 
 def take_reusable(available, command):
     """Removes from available and returns the passed record of command (in the form records store it), else None."""
-    wanted = [sanitize_text(part) for part in command]
+    wanted = [sanitize_text(part) for part in entry_argv(command)]
     for position, record in enumerate(available):
         if record['command'] == wanted:
             return available.pop(position)
@@ -218,24 +294,89 @@ class Receipt:
 
 class CommandFailed(ValueError):
     def __init__(self, record):
-        super().__init__(f"validation command failed (exit {record['exitCode']})")
+        if record.get('timedOut'):
+            super().__init__(f"validation command {record['summary']}")
+        else:
+            super().__init__(f"validation command failed (exit {record['exitCode']})")
         self.record = record
-def execute(command, tree, logs_dir=None, log_stem=None):
+
+
+class Interrupted(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def terminate_group(process):
+    """SIGTERM to the command's process group, SIGKILL for what is left of it KILL_GRACE_SECONDS later."""
+    def send(signum):
+        try:
+            os.killpg(process.pid, signum)
+            return True
+        except ProcessLookupError:
+            return False
+
+    if send(signal.SIGTERM):
+        end = time.monotonic() + KILL_GRACE_SECONDS
+        while time.monotonic() < end:
+            process.poll()
+            if not send(0):
+                break
+            time.sleep(0.1)
+        send(signal.SIGKILL)
+    process.wait()
+
+
+def run_group(args, tree, seconds):
+    """Runs args in its own process group within seconds: (returncode, stdout, stderr, timed_out). An overdue command
+    (and every process of its group) is terminated; an interrupt of this tool terminates it too, then exits."""
+    process = subprocess.Popen(args, cwd=tree, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+
+    def interrupt(signum, _frame):
+        raise Interrupted(signum)
+
+    saved = {}
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            saved[signum] = signal.signal(signum, interrupt)
+    except ValueError:  # not the main thread: no handlers to install
+        saved = {}
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=seconds)
+            return process.returncode, stdout, stderr, False
+        except subprocess.TimeoutExpired:
+            terminate_group(process)
+            stdout, stderr = process.communicate()
+            return TIMEOUT_EXIT_CODE, stdout, stderr, True
+    except Interrupted as error:
+        for signum in saved:
+            signal.signal(signum, signal.SIG_IGN)
+        terminate_group(process)
+        raise SystemExit(128 + error.signum)
+    finally:
+        for signum, handler in saved.items():
+            signal.signal(signum, handler)
+
+
+def execute(command, tree, logs_dir=None, log_stem=None, timeout_seconds=None):
+    if timeout_seconds is None:
+        timeout_seconds = deadline_seconds(command, {})
     started = datetime.datetime.now(datetime.timezone.utc)
-    result = subprocess.run(argv(command), cwd=tree, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    code, out, err, timed_out = run_group(entry_argv(command), tree, timeout_seconds)
     finished = datetime.datetime.now(datetime.timezone.utc)
-    stdout = result.stdout.decode('utf-8', 'replace')
-    stderr = result.stderr.decode('utf-8', 'replace')
+    stdout = (out or b'').decode('utf-8', 'replace')
+    stderr = (err or b'').decode('utf-8', 'replace')
     stdout_log = stderr_log = None
     if logs_dir is not None and log_stem is not None:
         stdout_log = logs_dir / f'{log_stem}.stdout.log'
         stderr_log = logs_dir / f'{log_stem}.stderr.log'
         write_log(stdout_log, stdout)
         write_log(stderr_log, stderr)
-    record = command_record(command, result.returncode, started, finished, stdout, stderr,
-                            stdout_log.name if stdout_log else '', stderr_log.name if stderr_log else '')
-    if result.returncode:
+    record = command_record(command, code, started, finished, stdout, stderr,
+                            stdout_log.name if stdout_log else '', stderr_log.name if stderr_log else '',
+                            timeout_seconds, timed_out)
+    if code:
         raise CommandFailed(record)
     return record
 
@@ -265,6 +406,8 @@ def run(args):
     # The final validation is the only long one: it records the commit it validates, saves what passed after every
     # command, and does not run again a command that already passed on this commit and tree.
     final = args.phase == 'final'
+    # Every deadline is resolved before anything runs, so a bad one stops the phase with no command started.
+    deadlines = [deadline_seconds(command, plan) for command in selected]
     tip, dirty, available = None, False, []
     if final:
         tip, dirty = tree_state(tree)
@@ -285,16 +428,17 @@ def run(args):
             if not proof.written:
                 proof.write('RUNNING', evidence)
             record = execute(command, tree, logs_dir=args.runtime / 'logs',
-                             log_stem=f'{args.ticket}.{args.phase}.{index}')
+                             log_stem=f'{args.ticket}.{args.phase}.{index}', timeout_seconds=deadlines[index])
             evidence.append(record)
             if final:
                 proof.write('RUNNING', evidence)
     except CommandFailed as exc:
         evidence.append(exc.record)
-        proof.write('FAIL', evidence, reason=str(exc), failed_command=exc.record['command'])
+        extra = {'timedOut': True} if exc.record.get('timedOut') else {}
+        proof.write('FAIL', evidence, reason=str(exc), failed_command=exc.record['command'], **extra)
         raise
     except OSError as exc:
-        proof.write('FAIL', evidence, reason=str(exc), failed_command=command)
+        proof.write('FAIL', evidence, reason=str(exc), failed_command=entry_argv(command))
         raise
     proof.write('PASS', evidence)
     print(f'{args.ticket} {args.phase}: PASS ({len(evidence)} commands{f", {reused} reused" if reused else ""})')
@@ -307,7 +451,7 @@ def main():
     parser.add_argument('manifest', type=Path)
     parser.add_argument('runtime', type=Path)
     parser.add_argument('ticket')
-    parser.add_argument('phase', choices=('cheap', 'component', 'expensive', 'final', 'baseline'))
+    parser.add_argument('phase', choices=('cheap', 'component', 'expensive', 'final', 'baseline', 'base'))
     args = parser.parse_args()
     try:
         run(args)

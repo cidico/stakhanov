@@ -7,7 +7,10 @@ own stdout shape; this extractor is the only translation into RESULT.schema.json
 It never interprets model prose and never treats another provider's wrapper as required.
 """
 
+import contextlib
+import io
 import json
+import math
 import os
 import re
 import sys
@@ -19,16 +22,28 @@ def fail(message: str) -> None:
     raise SystemExit(65)
 
 
-if len(sys.argv) != 4:
+# `--usage-only <provider> <raw-file> <usage-file>` writes only the usage of one provider run (even a failed one);
+# it never fails the caller.
+usage_only = sys.argv[1:2] == ["--usage-only"]
+if usage_only:
+    del sys.argv[1]
+    if len(sys.argv) != 4:
+        fail("usage: extract-result.py --usage-only <provider> <raw-file> <usage-file>")
+elif len(sys.argv) != 4:
     fail("usage: extract-result.py <provider> <raw-file> <result-file>")
 
 provider, raw_path, result_path = sys.argv[1:]
-try:
-    size = os.path.getsize(raw_path)
-    if size > 512 * 1024:
-        fail(f"{provider} structured output exceeds 512 KiB")
-except OSError:
-    fail(f"{provider} did not return a structured output file")
+size = 0
+
+
+def check_size():
+    global size
+    try:
+        size = os.path.getsize(raw_path)
+        if size > 512 * 1024:
+            fail(f"{provider} structured output exceeds 512 KiB")
+    except OSError:
+        fail(f"{provider} did not return a structured output file")
 
 
 def load_json_payload(path):
@@ -74,7 +89,96 @@ def load_json_payload(path):
     fail(f"{provider} did not return a JSON result (bytes={size})")
 
 
+USAGE_COUNTS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "num_turns", "duration_ms")
+
+
+def count(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or value != int(value)):
+        return None
+    return int(value) if value >= 0 else None
+
+
+def money(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def usage_claude(raw):
+    # claude --print --output-format json: total_cost_usd, usage{...}, num_turns, duration_ms, modelUsage{<model>: ...}.
+    raw = mapping(raw)
+    tokens = mapping(raw.get("usage"))
+    models = mapping(raw.get("modelUsage"))
+    model = raw.get("model")
+    if not isinstance(model, str) and len(models) == 1:
+        model = next(iter(models))
+    return {
+        "model": model,
+        "cost_usd": money(raw.get("total_cost_usd")),
+        "input_tokens": count(tokens.get("input_tokens")),
+        "output_tokens": count(tokens.get("output_tokens")),
+        "cache_read_tokens": count(tokens.get("cache_read_input_tokens")),
+        "cache_creation_tokens": count(tokens.get("cache_creation_input_tokens")),
+        "num_turns": count(raw.get("num_turns")),
+        "duration_ms": count(raw.get("duration_ms")),
+    }
+
+
+# Codex's last message and Grok's 1.0.13 envelope carry no cost or token count (see tests/fixtures): nothing is read
+# from them, so every field stays null instead of being guessed.
+usage_extractors = {"claude": usage_claude}
+
+
+def usage_record(raw):
+    found = usage_extractors.get(provider, lambda _: {})(raw)
+    record = {"provider": provider, "model": None, "cost_usd": None}
+    record.update({key: None for key in USAGE_COUNTS})
+    record.update({key: value for key, value in found.items() if key in record and key != "provider"})
+    if not isinstance(record["model"], str) or not record["model"] or len(record["model"]) > 200:
+        record["model"] = None
+    return record
+
+
+def write_usage(raw):
+    # Usage is bookkeeping: whatever goes wrong here is a warning, never a failed call.
+    usage_path = result_path if usage_only else result_path + ".usage.json"
+    try:
+        record = usage_record(raw)
+        directory = os.path.dirname(os.path.abspath(usage_path))
+        descriptor, temporary = tempfile.mkstemp(prefix=".usage-", dir=directory, text=True)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(record, stream, separators=(",", ":"))
+                stream.write("\n")
+            os.replace(temporary, usage_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    except Exception as error:
+        print(f"{provider} usage not recorded: {error}", file=sys.stderr)
+
+
+if usage_only:
+    raw = None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            check_size()
+            raw = load_json_payload(raw_path)
+    except SystemExit:
+        print(f"{provider} usage not recorded: no readable envelope", file=sys.stderr)
+        raise SystemExit(0)
+    write_usage(raw)
+    raise SystemExit(0)
+
+check_size()
 payload = load_json_payload(raw_path)
+write_usage(payload)
 
 
 def canonical_result(value):

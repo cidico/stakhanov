@@ -8,6 +8,8 @@ import re
 import sys
 
 
+FINDING_KEYS = {"severity", "path", "line", "message", "reason", "fix"}
+GUARD_KINDS = {"analyzer", "lint", "test", "validate", "executor", "reviewer-only"}
 PLACEHOLDERS = {"placeholder", "not implemented", "review incomplete", "todo", "stub", "fix it", "fix this",
                 "fix the issue", "needs work", "needs improvement", "address this", "improve this", "rework"}
 
@@ -117,8 +119,18 @@ if human_decision is not None:
 if not isinstance(result["findings"], list):
     fail("findings must be an array")
 for finding in result["findings"]:
-    if not isinstance(finding, dict) or set(finding) != {"severity", "path", "line", "message", "reason", "fix"}:
+    if not isinstance(finding, dict) or set(finding) - {"guard"} != FINDING_KEYS:
         fail("finding has invalid fields")
+    if "guard" not in finding:
+        fail("finding is missing its guard: name the automatic check that would have caught it, "
+             "guard {kind: analyzer|lint|test|validate|executor|reviewer-only, how: one line}")
+    guard = finding["guard"]
+    if not isinstance(guard, dict) or set(guard) != {"kind", "how"}:
+        fail("finding guard must be {kind, how}")
+    if not isinstance(guard["kind"], str) or guard["kind"] not in GUARD_KINDS:
+        fail("finding guard kind must be one of " + ", ".join(sorted(GUARD_KINDS)))
+    if not isinstance(guard["how"], str) or not 1 <= len(guard["how"]) <= 500 or "\n" in guard["how"]:
+        fail("finding guard how must be one line of at most 500 characters")
     if (
         finding["severity"] not in {"critical", "major", "minor"}
         or not all(isinstance(finding[key], str) and 1 <= len(finding[key]) <= 4000 for key in ("message", "reason", "fix"))
@@ -192,6 +204,9 @@ elif expected_role == "reviewer":
                     fail(f"reviewer {result['status']} finding needs a concrete {key}, not placeholder output")
             if f["fix"].strip() == f["message"].strip():
                 fail("reviewer finding fix must direct the correction, not repeat the defect")
+            how = f["guard"]["how"].strip()
+            if len(how) < 12 or how.lower().rstrip(".") in PLACEHOLDERS:
+                fail(f"reviewer {result['status']} finding needs a concrete guard how, not placeholder output")
     if result["status"] == "FIX" and not any(f["severity"] in {"critical", "major"} for f in result["findings"]):
         fail("reviewer FIX requires a critical or major finding; minor findings alone are notes on PASS")
     if human_decision is not None and result["status"] != "REPLAN":

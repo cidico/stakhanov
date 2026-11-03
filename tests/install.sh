@@ -88,6 +88,35 @@ t 'fresh install on main: only the chosen provider adapter and the shared files 
 t 'fresh install on main: the kit tests and project.json.example stay in the kit' \
   bash -c '[[ ! -e $1/.agentic/tests && ! -e $1/.agentic/project.json.example ]]' _ "$repo"
 t 'fresh install on main: provider skills are installed' test -f "$repo/.claude/skills/run-campaign/SKILL.md"
+t 'fresh install on main: the campaign-host skill and session-host are installed' \
+  bash -c '[[ -f $1/.claude/skills/campaign-host/SKILL.md && -x $1/.agentic/bin/session-host && -f $1/.agentic/providers/claude/session.sh ]]' _ "$repo"
+t 'fresh install on main: the claude agent definitions are installed, equal to the kit ones' \
+  bash -c 'for a in campaign-worker campaign-reviewer campaign-diagnostician; do cmp -s "$2/agents/claude/$a.md" "$1/.claude/agents/$a.md" || exit 1; done' _ "$repo" "$ROOT"
+t 'fresh install on main: the reviewer and the diagnostician cannot write, the worker cannot start agents' \
+  bash -c 'cd "$1/.claude/agents" && for a in campaign-reviewer campaign-diagnostician; do grep -q "^tools: Read, Grep, Glob, Bash$" $a.md && ! grep -qE "^tools:.*(Edit|Write|NotebookEdit)" $a.md || exit 1; done && grep -q "^disallowedTools: Agent$" campaign-worker.md' _ "$repo"
+t 'fresh install on main: role-guard is installed and executable' bash -c '[[ -x $1/.agentic/bin/role-guard ]]' _ "$repo"
+t 'fresh install on main: each agent carries the role-guard PreToolUse hook on Bash, with its own role' \
+  bash -c 'cd "$1/.claude/agents" && for a in worker reviewer diagnostician; do f=campaign-$a.md
+    grep -q "^hooks:$" $f && grep -q "^  PreToolUse:$" $f && grep -q "^    - matcher: Bash$" $f && grep -q "^        - type: command$" $f \
+      && grep -qE "^          command: .*/\.agentic/bin/role-guard $a.\$" $f || exit 1; done' _ "$repo"
+t 'fresh install on main: the hook command of each agent runs the installed role-guard, in a folder of the project too' \
+  bash -c 'cd "$1" && mkdir -p sub
+    hook() { # ROLE FOLDER PROJECT_DIR COMMAND: the hook as claude runs it, with the JSON of a Bash call on stdin
+      local command folder=$2
+      command=$(sed -n "s/^          command: .\(.*\).\$/\1/p" ".claude/agents/campaign-$1.md")
+      [[ -n $command ]] || return 99
+      (cd "$folder" && printf "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"%s\"}}" "$4" |
+        env -u CLAUDE_PROJECT_DIR ${3:+CLAUDE_PROJECT_DIR=$3} bash -c "$command" 2>&1)
+    }
+    for a in worker reviewer diagnostician; do
+      for where in "$1:$1" "$1/sub:$1" "$1/sub:"; do
+        rc=0; err=$(hook "$a" "${where%%:*}" "${where#*:}" "git add .") || rc=$?
+        [[ $rc -eq 2 ]] && grep -q "role-guard ($a): .*the runner commits and integrates; only read git is allowed" <<<"$err" || exit 1
+        rc=0; hook "$a" "${where%%:*}" "${where#*:}" "git status" >/dev/null || rc=$?
+        [[ $rc -eq 0 ]] || exit 1
+      done
+    done' _ "$repo"
+t 'fresh install on main: the agent definitions are in the next steps commit list' out_has '.claude/skills .claude/agents AGENTS.md'
 t 'fresh install on main: only the chosen provider is installed' bash -c '[[ ! -e $1/.codex && ! -e $1/.grok ]]' _ "$repo"
 t 'fresh install on main: .agentic/ISSUE-TRACKER.md equals the kit tracker' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
 t 'fresh install on main: nothing is written under docs' test ! -e "$repo/docs"
@@ -98,7 +127,7 @@ t 'fresh install on main: AGENTS.md carries the block between its markers' \
 t 'fresh install on main: CLAUDE.md is not created' test ! -e "$repo/CLAUDE.md"
 t 'fresh install on main: no warning when Matt skills are present' out_lacks 'WARNING'
 t 'fresh install on main: prints the next steps in order' \
-  bash -c 'grep -q "/grilling -> /to-spec -> /to-tickets -> /run-campaign -> /finalize-campaign" <<<"$1" && grep -q "git add .agentic .claude/skills AGENTS.md\$" <<<"$1"' _ "$OUT"
+  bash -c 'grep -q "/grilling -> /to-spec -> /to-tickets -> /run-campaign -> /finalize-campaign" <<<"$1" && grep -q "git add .agentic .claude/skills .claude/agents AGENTS.md\$" <<<"$1"' _ "$OUT"
 t 'fresh install on main: nothing is written to HOME' [ "$before_home" = "$(cd "$home" && find . | sort)" ]
 t 'fresh install on main: nothing is committed' [ "$(git -C "$repo" rev-list --count HEAD)" = 1 ]
 
@@ -108,6 +137,8 @@ inst "$home" --providers claude,codex "$repo"
 t 'fresh install on master: project.json detects master' jq -e '.main_branch == "master"' "$repo/.agentic/project.json"
 t 'fresh install on master: both providers get their skills' \
   bash -c '[[ -f $1/.claude/skills/run-campaign/SKILL.md && -f $1/.codex/skills/run-campaign/SKILL.md ]]' _ "$repo"
+t 'fresh install on master: only claude gets agent definitions' \
+  bash -c '[[ -f $1/.claude/agents/campaign-worker.md && ! -e $1/.codex/agents ]]' _ "$repo"
 repo=$work/no-commit
 home=$(new_home no-commit)
 git init -q -b trunk "$repo"
@@ -135,6 +166,7 @@ printf '%s\n' "${tampered//Functional acceptance first/TAMPERED}" >"$repo/AGENTS
 jq '.name = "custom" | .required_checks = [["true"]]' "$repo/.agentic/project.json" >"$work/project.json.new"
 mv -- "$work/project.json.new" "$repo/.agentic/project.json"
 printf 'stale\n' >"$repo/.claude/skills/run-campaign/stale.txt"
+printf 'stale\n' >"$repo/.claude/agents/campaign-worker.md"
 inst "$home" --update "$repo"
 t '--update: succeeds' [ "$RC" -eq 0 ]
 t '--update: project.json is kept' jq -e '.name == "custom" and .required_checks == [["true"]]' "$repo/.agentic/project.json"
@@ -143,6 +175,7 @@ t '--update: text before the block is untouched' [ "$(head -n 3 "$repo/AGENTS.md
 t '--update: text after the block is untouched' [ "$(tail -n 1 "$repo/AGENTS.md")" = 'after text' ]
 t '--update: reports the block as updated' out_has 'stakhanov block updated'
 t '--update: provider skills are replaced' test ! -e "$repo/.claude/skills/run-campaign/stale.txt"
+t '--update: agent definitions are replaced' cmp -s "$ROOT/agents/claude/campaign-worker.md" "$repo/.claude/agents/campaign-worker.md"
 
 # --- AGENTS.md created when missing; CLAUDE.md never touched.
 setup claude-md
@@ -180,7 +213,7 @@ t 'identical old tracker: listed under Removed from the project' \
   bash -c 'grep -A1 "^Removed from the project:" <<<"$1" | grep -q "docs/agents/issue-tracker.md"' _ "$OUT"
 t 'identical old tracker: no tracker warning' out_lacks 'WARNING'
 t 'identical old tracker: the printed git add includes the removal' \
-  bash -c 'grep -q "git add .agentic .claude/skills AGENTS.md docs/agents/issue-tracker.md\$" <<<"$1"' _ "$OUT"
+  bash -c 'grep -q "git add .agentic .claude/skills .claude/agents AGENTS.md docs/agents/issue-tracker.md\$" <<<"$1"' _ "$OUT"
 t 'identical old tracker: running the printed git add stages the deletion' \
   bash -c 'cd "$1" && git add .agentic .claude/skills AGENTS.md docs/agents/issue-tracker.md && git diff --cached --no-renames --name-status | grep -q "^D.docs/agents/issue-tracker.md$" && [[ -z $(git status --porcelain | grep "^.D") ]]' _ "$repo"
 inst "$home" --update "$repo"
@@ -194,7 +227,7 @@ inst "$home" --providers claude "$repo"
 t 'identical untracked old tracker: the file and its folders are deleted' test ! -e "$repo/docs"
 t 'identical untracked old tracker: listed under Removed from the project' out_has 'Removed from the project'
 t 'identical untracked old tracker: git add does not name the old path' \
-  bash -c 'grep -q "git add .agentic .claude/skills AGENTS.md\$" <<<"$1"' _ "$OUT"
+  bash -c 'grep -q "git add .agentic .claude/skills .claude/agents AGENTS.md\$" <<<"$1"' _ "$OUT"
 
 # Folders that still hold something are kept.
 setup tracker-identical-shared
@@ -226,7 +259,7 @@ t 'differing old tracker: warns that it is ignored and names the file the kit re
 t 'differing old tracker: .agentic/ISSUE-TRACKER.md is installed anyway' cmp -s "$KIT_TRACKER" "$repo/.agentic/ISSUE-TRACKER.md"
 t 'differing old tracker: nothing is listed as removed' out_lacks 'Removed from the project'
 t 'differing old tracker: git add does not name it' \
-  bash -c 'grep -q "git add .agentic .claude/skills AGENTS.md\$" <<<"$1"' _ "$OUT"
+  bash -c 'grep -q "git add .agentic .claude/skills .claude/agents AGENTS.md\$" <<<"$1"' _ "$OUT"
 inst "$home" --update "$repo"
 t 'differing old tracker: kept and warned again on --update' out_has 'WARNING: docs/agents/issue-tracker.md differs'
 t 'differing old tracker: --update does not touch it' cmp -s "$work/tracker.orig" "$repo/$OLD_TRACKER"

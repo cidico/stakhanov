@@ -421,6 +421,26 @@ for p in "${providers[@]}"; do
   done
 done
 
+# Provider agent definitions (the subagents a host session runs the roles with): agents/<provider>/*.md go to the project's
+# .<provider>/agents/, replaced by --update like the skills.
+for p in "${providers[@]}"; do
+  [[ -d $KIT/agents/$p ]] || continue
+  dest=$project/.$p/agents
+  mkdir -p "$dest"
+  for agent_file in "$KIT/agents/$p"/*.md; do
+    agent=$(basename -- "$agent_file")
+    if [[ -e $dest/$agent ]]; then
+      if [[ $update == true ]]; then
+        cp -- "$agent_file" "$dest/$agent"; changed+=(".$p/agents/$agent")
+      else
+        warnings+=("kept the existing .$p/agents/$agent (use --update to overwrite it)")
+      fi
+    else
+      cp -- "$agent_file" "$dest/$agent"; created+=(".$p/agents/$agent")
+    fi
+  done
+done
+
 # Tracker configuration: /to-spec and /to-tickets publish wherever it says. It is a file of the engine, so the copy
 # above already installed it. Earlier kits wrote a copy into the project: an identical one is now dead weight and is
 # removed (with the folders it leaves empty); a different one is kept, but nothing reads it any more.
@@ -516,7 +536,10 @@ if ((${#login_needed[@]})); then
 fi
 
 commit_paths=(.agentic)
-for p in "${providers[@]}"; do commit_paths+=(".$p/skills"); done
+for p in "${providers[@]}"; do
+  commit_paths+=(".$p/skills")
+  [[ ! -d $KIT/agents/$p ]] || commit_paths+=(".$p/agents")
+done
 commit_paths+=("$INSTRUCTION_FILE")
 [[ $old_tracker_staged == false ]] || commit_paths+=("$OLD_TRACKER")
 commit_list=$(join ' ' "${commit_paths[@]}")

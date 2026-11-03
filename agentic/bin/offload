@@ -93,6 +93,8 @@ if ! $nested; then
 fi
 # shellcheck source=../lib/remote.sh
 source "$agentic_dir/lib/remote.sh"
+# shellcheck source=../lib/slots.sh
+source "$agentic_dir/lib/slots.sh"
 
 temporary=$(mktemp -d)
 job_pids=() pgid_files=() stop_where=local
@@ -101,6 +103,7 @@ trap 'rm -rf -- "$temporary"' EXIT
 on_signal() {
   trap '' TERM INT
   local file
+  slot_release
   printf 'offload: interrupted; stopping the run%s\n' "$( [[ $stop_where == local ]] || printf ' on %s' "$destination")" >&2
   if ((${#job_pids[@]} > 0)); then kill "${job_pids[@]}" 2>/dev/null || true; fi
   for file in "${pgid_files[@]}"; do
@@ -138,9 +141,13 @@ summary() {
   return "$failed"
 }
 
-# run_here: COMMAND on this machine, from the current folder, with the same additions as on an executor.
+# run_here: COMMAND on this machine, from the current folder, with the same additions as on an executor. It takes a
+# machine slot (lib/slots.sh) unless it already runs in one (AGENTIC_SLOT: a round of a ticket, a final validation) or is
+# itself an offloaded command or an executor run; the slot's guard ends with COMMAND, which exec keeps in this process.
 run_here() {
   local index
+  # A capacity that cannot be read fails the command; it never turns the limit off.
+  if ! $nested; then slot_take validation "offload $here" || exit $?; fi
   if ((${#each_values[@]} == 0)); then
     rm -rf -- "$temporary"
     exec env "AGENTIC_UNITS=$units" AGENTIC_OFFLOAD=1 "$@"
@@ -155,6 +162,7 @@ run_here() {
     wait "${job_pids[0]}" || true
   done
   job_pids=() pgid_files=()
+  slot_release
   summary local && exit 0
   exit 1
 }

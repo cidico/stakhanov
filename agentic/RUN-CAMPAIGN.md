@@ -98,10 +98,10 @@ to see every campaign and queue at once.
 - A ticket that legitimately changes an instruction file is rejected with "worker edited coordinator-owned
   instructions". Review the change, remove it from the ticket worktree, commit only that file as coordinator
   on the campaign branch, then `campaign recover <id>` and `campaign run`. Do not ask the human for this.
-- Validation commands have no deadline: a stuck test holds its phase until someone kills it. Find it in the
-  runner's process tree (the engine's pid is in `runner.pid` in the campaign's cache folder; list its children
-  with `pstree -p <pid>` or `ps --forest`) and kill that process; the command then fails like any failed
-  validation. `AGENTIC_WORKER_TIMEOUT_SECONDS` limits only a worker, so raise it
+- A ticket blocked as `environment: <command> (<cause>)` failed because of the machine, not of its code: the command
+  does not exist there, ran past its deadline, or printed one of the project's `environment_failure_patterns`. It gets
+  no repair and no automatic recovery: fix the machine (or the deadline in `validation.json`), then
+  `campaign recover <id>` and `campaign run`. `AGENTIC_WORKER_TIMEOUT_SECONDS` limits only a worker, so raise it
   on `campaign run` for a ticket whose worker itself runs long suites.
 - A wait loop stuck on `pgrep -f` matches its own shell: kill only that loop's PID, never `pkill -f` with
   the text.

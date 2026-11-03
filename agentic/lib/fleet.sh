@@ -131,6 +131,12 @@ export PATH="$PATH:$HOME/.local/bin"
 cd -- "$1" && exec ./.agentic/bin/campaign overview --json
 SCRIPT
 
+# PATH: the machine report (slots, load, accounts, proven capabilities) of the clone at PATH, as JSON.
+read -r -d '' FLEET_MACHINE <<'SCRIPT' || true
+export PATH="$PATH:$HOME/.local/bin"
+cd -- "$1" && exec ./.agentic/bin/campaign machine --json
+SCRIPT
+
 # COMMAND...: installs the commands the kit needs with the machine's package manager, as root or through sudo without a
 # password. Exit 3 with the command to run on stdout when sudo needs a password; exit 4 without a package manager it
 # knows. The proxy variables of the session go along.
@@ -189,6 +195,11 @@ export PATH="$PATH:$HOME/.local/bin"
 command -v "$1" >/dev/null 2>&1
 SCRIPT
 
+read -r -d '' FLEET_ACCOUNTS <<'SCRIPT' || true
+export PATH="$PATH:$HOME/.local/bin"
+exec "$1" account list --json
+SCRIPT
+
 read -r -d '' FLEET_PROVIDER <<'SCRIPT' || true
 export PATH="$PATH:$HOME/.local/bin"
 cd -- "$1" || exit 1
@@ -242,7 +253,7 @@ travelling_settings() {
   fi | while IFS= read -r -d '' assignment; do
     case ${assignment%%=*} in
       AGENTIC_CACHE | AGENTIC_FLEET | AGENTIC_MACHINE_ID | AGENTIC_SSH | AGENTIC_PROVIDER_DIR | AGENTIC_SUPERVISOR | \
-        AGENTIC_SUPERVISED | AGENTIC_CAMPAIGN_ROOT | AGENTIC_QUEUE | AGENTIC_OPEN_VIA) ;;
+        AGENTIC_SUPERVISED | AGENTIC_CAMPAIGN_ROOT | AGENTIC_QUEUE | AGENTIC_OPEN_VIA | AGENTIC_SLOT | AGENTIC_STATE) ;;
       *) printf '%s\0' "$assignment" ;;
     esac
   done
@@ -264,6 +275,7 @@ fleet_check() {
           elif (.value.ssh | type) != "string" or (.value.ssh | test("^[^-\\s]\\S*$") | not) then
             "machine \(.key): ssh must be an ssh destination or alias"
           elif (.value.id | type) != "string" or .value.id == "" then "machine \(.key): id must be its machine id"
+          elif .value.accepts != null and (.value.accepts | type) != "boolean" then "machine \(.key): accepts must be true or false"
           else empty end]
        + [.machines | to_entries | group_by(.value.id?)[] | select(length > 1)
           | "machines \(map(.key) | join(" and ")) have the same id"]
@@ -340,25 +352,115 @@ fleet_fetch() {
     "+refs/heads/$MAIN_BRANCH:refs/remotes/$1/$MAIN_BRANCH" "+refs/heads/campaign/*:refs/remotes/$1/campaign/*"
 }
 
-# fleet_query OVERVIEW NAME SSH PATH: fetches from one machine and, with OVERVIEW true, reads its campaign overview.
-# Leaves $fleet_temp/NAME.overview, or $fleet_temp/NAME.error when the machine could not answer.
+# fleet_query DETAIL NAME SSH PATH: fetches from one machine and, with DETAIL true, reads its campaign overview; with
+# DETAIL machine, its machine report (campaign machine --json). Leaves $fleet_temp/NAME.overview (or NAME.machine), or
+# $fleet_temp/NAME.error when the machine could not answer.
 fleet_query() {
-  local want=$1 name=$2 destination=$3 path=$4 out="$fleet_temp/$2"
+  local want=$1 name=$2 destination=$3 path=$4 out="$fleet_temp/$2" script='' extension=''
   fleet_fetch "$name" "$destination" "$path" 2>"$out.error" || return 0
-  if [[ $want == true ]] && ! remote_script "$FLEET_OVERVIEW" "$path" >"$out.overview" 2>"$out.error"; then
-    rm -f -- "$out.overview"
-    return 0
+  case $want in
+    true) script=$FLEET_OVERVIEW extension=overview ;;
+    machine) script=$FLEET_MACHINE extension=machine ;;
+  esac
+  if [[ -n $extension ]]; then
+    if ! remote_script "$script" "$path" >"$out.$extension" 2>"$out.error"; then
+      rm -f -- "$out.$extension"
+      return 0
+    fi
+    if ! jq -e 'type == "object"' "$out.$extension" >/dev/null 2>&1; then
+      printf 'answered with something that is not a JSON object\n' >"$out.error"
+      rm -f -- "$out.$extension"
+      return 0
+    fi
   fi
   rm -f -- "$out.error"
 }
 
-# fleet_gather OVERVIEW: fleet_query on every other machine of the project at once.
-fleet_gather() {
-  local name ssh path
-  while IFS=$'\t' read -r name ssh path; do
-    fleet_query "$1" "$name" "$ssh" "$path" &
+# <cache>/fleet.lock (flock) lets one survey of the fleet run at a time on this machine: two processes fetching the same
+# peers at once collide on git's ref locks ("cannot lock ref") and a peer looks down. The lock also covers fleet-seen.json,
+# which a survey reads and writes. A process that holds it keeps it (fleet_lock_take says whether it took it now).
+fleet_lock_file() { printf '%s/fleet.lock\n' "$(runtime_base)"; }
+
+# fleet_lock_take: takes fleet.lock, waiting for its holder (up to 5 minutes, then dies). Status 0 when it took the lock
+# now (the caller releases it with fleet_lock_release), 1 when this process already held it.
+fleet_lock_take() {
+  local file fd
+  [[ -z ${FLEET_LOCK_FD:-} ]] || return 1
+  file=$(fleet_lock_file)
+  mkdir -p -- "$(dirname -- "$file")"
+  chmod 700 "$(dirname -- "$file")" 2>/dev/null || true
+  exec {fd}>>"$file"
+  if ! flock -n "$fd" && ! flock -w 300 "$fd"; then
+    exec {fd}>&-
+    die "another survey of the fleet has held $file for over 5 minutes"
+  fi
+  FLEET_LOCK_FD=$fd
+}
+
+fleet_lock_release() {
+  local fd=${FLEET_LOCK_FD:-}
+  [[ -n $fd ]] || return 0
+  FLEET_LOCK_FD=''
+  exec {fd}>&-
+}
+
+# The survey of the peers is kept for AGENTIC_FLEET_CACHE_SECONDS (default 30; 0 keeps nothing), per level of detail
+# (OVERVIEW false, true or machine), in <cache>/fleet-cache/: the peers' overviews, machine reports and errors as fleet_gather left them. It is
+# only valid for the same project, main branch and peers; fleet_cache_clear drops it when this machine changes what a
+# survey would show.
+fleet_cache_dir() { printf '%s/fleet-cache/%s\n' "$(runtime_base)" "$1"; }
+
+fleet_cache_seconds() {
+  local seconds=${AGENTIC_FLEET_CACHE_SECONDS:-30}
+  [[ $seconds =~ ^[0-9]+$ ]] || die "AGENTIC_FLEET_CACHE_SECONDS must be a whole number of seconds: $seconds"
+  printf '%s\n' "$seconds"
+}
+
+fleet_cache_key() { { printf '%s\n' "$FLEET_PROJECT" "$MAIN_BRANCH" "$1"; fleet_peers; } | sha256sum | cut -d' ' -f1; }
+
+fleet_cache_clear() { rm -rf -- "$(runtime_base)/fleet-cache"; }
+
+# fleet_cache_load OVERVIEW: restores the cached files of the peers into $fleet_temp when they are fresh; sets
+# FLEET_GATHERED_AT to when they were gathered.
+fleet_cache_load() {
+  local dir seconds stamp
+  dir=$(fleet_cache_dir "$1"); seconds=$(fleet_cache_seconds)
+  ((seconds > 0)) && [[ -f $dir/key && $(<"$dir/key") == "$(fleet_cache_key "$1")" ]] || return 1
+  stamp=$(stat -c %Y "$dir/key") || return 1
+  (($(date +%s) - stamp < seconds)) || return 1
+  cp -- "$dir"/files/* "$fleet_temp/" 2>/dev/null || true
+  FLEET_GATHERED_AT=$(date -u -d "@$stamp" +%Y-%m-%dT%H:%M:%SZ)
+}
+
+fleet_cache_store() {
+  local dir
+  ((($(fleet_cache_seconds)) > 0)) || return 0
+  dir=$(fleet_cache_dir "$1")
+  rm -rf -- "$dir"; mkdir -p -- "$dir/files"
+  while IFS=$'\t' read -r name _; do
+    [[ ! -f $fleet_temp/$name.overview ]] || cp -- "$fleet_temp/$name.overview" "$dir/files/"
+    [[ ! -f $fleet_temp/$name.machine ]] || cp -- "$fleet_temp/$name.machine" "$dir/files/"
+    [[ ! -f $fleet_temp/$name.error ]] || cp -- "$fleet_temp/$name.error" "$dir/files/"
   done < <(fleet_peers)
-  wait
+  fleet_cache_key "$1" >"$dir/key"
+}
+
+# fleet_gather OVERVIEW: fleet_query on every other machine of the project at once, under fleet.lock, unless a survey that
+# ended a moment ago (fleet_cache_load) already did. Sets FLEET_GATHERED_AT.
+fleet_gather() {
+  local want=$1 took=false name ssh path
+  fleet_lock_take && took=true
+  while IFS=$'\t' read -r name ssh path; do rm -f -- "$fleet_temp/$name.overview" "$fleet_temp/$name.machine" "$fleet_temp/$name.error"; done < <(fleet_peers)
+  if ! fleet_cache_load "$want"; then
+    while IFS=$'\t' read -r name ssh path; do
+      # The lock stays with this process: a command that outlives the survey (an ssh master) must not hold it.
+      ( exec {FLEET_LOCK_FD}>&-; fleet_query "$want" "$name" "$ssh" "$path" ) &
+    done < <(fleet_peers)
+    wait
+    FLEET_GATHERED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    fleet_cache_store "$want"
+  fi
+  if $took; then fleet_lock_release; fi
 }
 
 # fleet_counts NAME: "THERE HERE", the commits that only NAME's main branch (as last fetched) has and that only this
@@ -386,18 +488,25 @@ fleet_seen_file() { printf '%s/fleet-seen.json\n' "$(runtime_base)"; }
 # fleet_survey OVERVIEW: this project's fleet as JSON: {project, main_branch, this_machine, machines, warnings}. Every
 # machine has name, ssh, path, self and reachable; a reachable peer adds main_branch {only_there, only_here}, an
 # unreachable one its error. With OVERVIEW true each machine also has the campaigns and queues of its overview: the last
-# ones seen (seen_at) when it does not answer.
+# ones seen (seen_at) when it does not answer. With OVERVIEW machine, the fields of its machine report instead (lib/machine.sh),
+# likewise the last ones seen when it does not answer.
 fleet_survey() {
-  local want=$1 now seen_file seen='{}' self_entry machines name ssh path entry counts there here warning
-  local warnings=()
-  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local want=$1 now seen_file seen='{}' report self_entry machines name ssh path entry counts there here warning
+  local warnings=() took=false
+  # fleet-seen.json is read and written under the same lock as the fetches, so a survey that overlaps this one neither
+  # loses its update nor fetches the same refs at once.
+  fleet_lock_take && took=true
   seen_file=$(fleet_seen_file)
   [[ ! -f $seen_file ]] || seen=$(jq -c . "$seen_file" 2>/dev/null) || seen='{}'
   fleet_gather "$want"
+  now=$FLEET_GATHERED_AT
   self_entry=$(jq -cn --arg name "${FLEET_SELF:-$(fleet_hostname)}" --arg ssh "$(fleet_ssh_of "$FLEET_SELF")" \
     --arg path "$(main_worktree)" '{name: $name, ssh: $ssh, path: $path, self: true, reachable: true}')
   if [[ $want == true ]]; then
     self_entry=$(jq -c --argjson overview "$(cmd_overview --json)" '. + $overview' <<<"$self_entry")
+  elif [[ $want == machine ]]; then
+    report=$(machine_read) || exit $?
+    self_entry=$(jq -c --argjson report "$report" '$report + .' <<<"$self_entry")
   fi
   machines="[$self_entry]"
   while IFS=$'\t' read -r name ssh path; do
@@ -406,7 +515,11 @@ fleet_survey() {
       entry=$(jq -c --arg error "$(fleet_reason "$fleet_temp/$name.error")" '. + {reachable: false, error: $error}' <<<"$entry")
       if [[ $want == true ]]; then
         entry=$(jq -c --arg name "$name" --argjson seen "$seen" \
-          '. + {seen_at: $seen[$name].at, campaigns: ($seen[$name].overview.campaigns // []), queues: ($seen[$name].overview.queues // [])}' <<<"$entry")
+          '. + {seen_at: $seen[$name].at, campaigns: ($seen[$name].overview.campaigns // []), queues: ($seen[$name].overview.queues // []),
+            rounds: ($seen[$name].overview.rounds // [])}' <<<"$entry")
+      elif [[ $want == machine ]]; then
+        entry=$(jq -c --arg name "$name" --argjson seen "$seen" \
+          '($seen[$name].machine.report // {}) + . + {seen_at: $seen[$name].machine.at}' <<<"$entry")
       fi
     else
       IFS=' ' read -r there here <<<"$(fleet_counts "$name")"
@@ -420,15 +533,20 @@ fleet_survey() {
           | .campaigns |= map(if .open then .open = "\($via) '"'"'" + (.open | gsub("'"'"'"; "'"'"'\\'"'"''"'"'")) + "'"'"'" else . end)' \
           <<<"$entry")
         seen=$(jq -c --arg name "$name" --arg now "$now" --slurpfile overview "$fleet_temp/$name.overview" \
-          '.[$name] = {at: $now, overview: $overview[0]}' <<<"$seen")
+          '.[$name] = ((.[$name] // {}) + {at: $now, overview: $overview[0]})' <<<"$seen")
+      elif [[ $want == machine ]]; then
+        entry=$(jq -c --arg now "$now" --slurpfile report "$fleet_temp/$name.machine" '$report[0] + . + {seen_at: $now}' <<<"$entry")
+        seen=$(jq -c --arg name "$name" --arg now "$now" --slurpfile report "$fleet_temp/$name.machine" \
+          '.[$name] = ((.[$name] // {}) + {machine: {at: $now, report: $report[0]}})' <<<"$seen")
       fi
     fi
     machines=$(jq -c --argjson entry "$entry" '. + [$entry]' <<<"$machines")
   done < <(fleet_peers)
-  if [[ $want == true ]]; then
+  if [[ $want == true || $want == machine ]]; then
     mkdir -p -- "$(dirname -- "$seen_file")"
     printf '%s\n' "$seen" >"$seen_file.tmp" && mv -f -- "$seen_file.tmp" "$seen_file"
   fi
+  if $took; then fleet_lock_release; fi
   jq -n --arg project "$FLEET_PROJECT" --arg main "$MAIN_BRANCH" --arg self "$FLEET_SELF" --argjson machines "$machines" \
     --args '{project: $project, main_branch: $main, this_machine: (if $self == "" then null else $self end),
              machines: $machines, warnings: $ARGS.positional}' "${warnings[@]}"
@@ -581,6 +699,24 @@ fleet_project_providers() {
   done
 }
 
+# fleet_account_logins NAME: a pending item for each account that the hook (AGENTIC_CLAUDE_ACCOUNTS) lists on NAME
+# ($destination) without a login or without its onboarding, with the command that fixes it. A hook that does not know
+# `account list --json` (exit 2) or does not print JSON adds nothing.
+fleet_account_logins() {
+  local machine=$1 listing key path reason
+  listing=$(remote_script "$FLEET_ACCOUNTS" "$AGENTIC_CLAUDE_ACCOUNTS" 2>/dev/null) || return 0
+  while IFS=$'\t' read -r key path reason; do
+    [[ -n $key ]] || continue
+    case $reason in
+      login) pending+=("claude account $key is not signed in on $machine: ssh -t $destination 'CLAUDE_CONFIG_DIR=$path claude' (once, to sign in)") ;;
+      *) pending+=("claude account $key has not completed its onboarding on $machine: ssh -t $destination 'CLAUDE_CONFIG_DIR=$path claude' (once, to finish it)") ;;
+    esac
+  done < <(jq -r 'if type == "array" then .[] else empty end
+    | select(type == "object" and (.key | type) == "string" and (.path | type) == "string"
+        and (.logged_in == false or .onboarded == false))
+    | [.key, .path, (if .logged_in == false then "login" else "onboarding" end)] | @tsv' <<<"$listing" 2>/dev/null)
+}
+
 # fleet_ready_providers NAME PATH: each provider of the project ready on NAME ($destination): installed for its user
 # when missing, signed in (in a terminal) when not, and its preflight passing. What is left is a pending item.
 fleet_ready_providers() {
@@ -621,6 +757,8 @@ fleet_ready_providers() {
     if [[ $provider == claude && -n ${AGENTIC_CLAUDE_ACCOUNTS:-} ]] \
         && ! remote_script "$FLEET_COMMAND" "$AGENTIC_CLAUDE_ACCOUNTS" >/dev/null 2>&1; then
       pending+=("the claude account hook $AGENTIC_CLAUDE_ACCOUNTS (AGENTIC_CLAUDE_ACCOUNTS) is not installed on $machine: install it there; until then claude runs in one account there and stops at its usage limit")
+    elif [[ $provider == claude && -n ${AGENTIC_CLAUDE_ACCOUNTS:-} ]]; then
+      fleet_account_logins "$machine"
     fi
   done < <(fleet_project_providers)
 }
@@ -860,6 +998,8 @@ route_campaign() {
   # Where the person is: the way to open the campaign starts with the ssh to its machine.
   settings+=("AGENTIC_OPEN_VIA=ssh -t $destination")
   remote_script "$FLEET_CAMPAIGN" "$tree" "$(fleet_project_path "$name")" "${settings[@]}" -- "$command" "$@" || rc=$?
+  # The command may have changed what the machine shows: the next survey asks again.
+  fleet_cache_clear
   exit "$rc"
 }
 

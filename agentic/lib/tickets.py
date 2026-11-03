@@ -97,6 +97,7 @@ def parse_ticket(path: Path) -> dict:
     meta["required"] = meta.get("required", True)
     if not isinstance(meta["required"], bool):
         raise TicketError(f"{path}: required must be true or false")
+    check_validate_base(path, meta)
     for optional_list in ("collision_domains", "expensive_operations"):
         if optional_list in meta and (
             not isinstance(meta[optional_list], list)
@@ -111,6 +112,22 @@ def parse_ticket(path: Path) -> dict:
     meta["goal"] = " ".join(section_text(text, "Goal").split())
     meta["path"] = str(path.resolve())
     return meta
+
+
+def check_validate_base(path: Path, meta: dict):
+    """validate_base is skip or absent (the engine then proves the ticket's validation fails on the base), and a skip
+    carries the reason in validate_base_reason; the reason alone means nothing."""
+    skip = meta.get("validate_base")
+    reason = meta.get("validate_base_reason")
+    if "validate_base" in meta and skip != "skip":
+        raise TicketError(f"{path}: validate_base must be 'skip' (leave it out to run the check on the base)")
+    if skip == "skip" and (not isinstance(reason, str) or not reason.strip()):
+        raise TicketError(f"{path}: validate_base: skip needs a non-empty validate_base_reason saying why the "
+                          f"validation cannot fail on the base")
+    if skip != "skip" and "validate_base_reason" in meta:
+        raise TicketError(f"{path}: validate_base_reason without validate_base: skip")
+    meta["validate_base"] = skip
+    meta["validate_base_reason"] = reason.strip() if skip == "skip" else None
 
 
 def section_text(text: str, name: str) -> str:

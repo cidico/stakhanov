@@ -35,6 +35,8 @@ if [[ ! -f $host/env ]]; then
   exit 255
 fi
 shift
+# A real ssh carries no environment: what the caller exports reaches the other side only as the command's words.
+unset AGENTIC_SLOT AGENTIC_STATE
 set -a
 . "$host/env"
 set +a
@@ -316,6 +318,23 @@ class FleetTests(unittest.TestCase):
         status = json.loads(self.on("box", "status", "--campaign", "harness-sample", "--json").stdout)
         self.assertEqual(status["campaign"], "harness-sample")
 
+    def test_what_belongs_to_a_machine_does_not_travel_with_a_routed_command(self):
+        self.join()
+        self.init_on("box", "remote-one")
+        # The kit of box's clone reports the AGENTIC_* variables it was started with, then runs as usual.
+        kit = self.clone("box") / ".agentic" / "bin" / "campaign"
+        kit.rename(kit.with_name("campaign-real"))
+        seen = self.hosts / "box" / "seen.env"
+        kit.write_text(f'#!/usr/bin/env bash\nenv | grep "^AGENTIC_" >>{shlex.quote(str(seen))}\n'
+                       'exec "$(dirname -- "${BASH_SOURCE[0]}")/campaign-real" "$@"\n')
+        kit.chmod(0o755)
+        # From inside a round: its slot and the machine's state folder are in the environment.
+        self.repo.command("status", "--campaign", "remote-one", "--json",
+                          env={"AGENTIC_SLOT": "3", "AGENTIC_STATE": "/here/state", "AGENTIC_CLAUDE_MODEL": "sonnet"})
+        arrived = seen.read_text().splitlines()
+        self.assertIn("AGENTIC_CLAUDE_MODEL=sonnet", arrived)
+        self.assertEqual([line for line in arrived if line.startswith(("AGENTIC_SLOT=", "AGENTIC_STATE="))], [])
+
     def test_another_machines_campaign_opens_through_the_ssh_to_it(self):
         self.join()
         self.init_on("box", "remote-one")
@@ -532,6 +551,43 @@ esac
         result = self.join(env={"AGENTIC_CLAUDE_ACCOUNTS": "some-hook"})
         self.assertIn("every command works there", result.stdout)
 
+    def accounts_hook(self, listing, status=0):
+        """A hook for the fake machine box whose `account list --json` prints LISTING and exits with STATUS."""
+        hook = self.hosts / "box" / "home" / ".local" / "bin" / "accounts-hook"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text('#!/bin/sh\nif [ "$1 $2 $3" = "account list --json" ]; then\n'
+                        f"  cat <<'JSON'\n{listing}\nJSON\n  exit {status}\nfi\nexit 2\n")
+        hook.chmod(0o755)
+
+    def test_an_account_without_login_or_onboarding_is_pending(self):
+        self.with_claude_skill()
+        self.mock_provider_on("box", "installed", "signed-in")
+        home = self.hosts / "box" / "home"
+        self.accounts_hook(json.dumps([
+            {"key": "work", "path": str(home / ".claude-work"), "identity": "a/b", "logged_in": True, "onboarded": True},
+            {"key": "spare", "path": str(home / ".claude-spare"), "identity": "", "logged_in": False, "onboarded": False},
+            {"key": "fresh", "path": str(home / ".claude-fresh"), "identity": "c/d", "logged_in": True, "onboarded": False}]))
+        result = self.join(check=False, env={"AGENTIC_CLAUDE_ACCOUNTS": "accounts-hook"})
+        self.assertEqual(result.returncode, 3)
+        items = [line for line in result.stdout.splitlines() if "claude account" in line]
+        self.assertEqual(len(items), 2, result.stdout)
+        self.assertIn(f"claude account spare is not signed in on box: ssh -t box 'CLAUDE_CONFIG_DIR={home}/.claude-spare claude'",
+                      items[0])
+        self.assertIn(f"claude account fresh has not completed its onboarding on box: ssh -t box "
+                      f"'CLAUDE_CONFIG_DIR={home}/.claude-fresh claude'", items[1])
+        self.assertNotIn("work", "".join(items))
+
+    def test_an_account_hook_that_cannot_list_adds_nothing(self):
+        self.with_claude_skill()
+        self.mock_provider_on("box", "installed", "signed-in")
+        # An old hook does not know `account list` (exit 2); another prints something that is not JSON.
+        self.accounts_hook("[]", status=2)
+        result = self.join(env={"AGENTIC_CLAUDE_ACCOUNTS": "accounts-hook"})
+        self.assertIn("every command works there", result.stdout)
+        self.accounts_hook("not json at all")
+        result = self.join(env={"AGENTIC_CLAUDE_ACCOUNTS": "accounts-hook"})
+        self.assertIn("every command works there", result.stdout)
+
     def restricted_path(self, name, without, extra=None):
         """A PATH for the fake machine NAME with every system command but WITHOUT, plus the EXTRA scripts."""
         folder = self.hosts / name / "bin"
@@ -605,6 +661,55 @@ case $1 in show-user) echo no ;; enable-linger) echo 'Access denied' >&2; exit 1
         self.assertEqual(result.returncode, 3)
         self.assertIn("missing.env (files of proof in the fleet file) does not exist in this clone", result.stdout)
         self.assertIn("the setup of proof failed on box (exit 1): false in", result.stdout)
+
+    def counting_ssh(self):
+        """An ssh that logs every call (returned) and takes a second, so that surveys at once really overlap."""
+        log = self.hosts.parent / "ssh.log"
+        wrapper = self.ssh.parent / "slow-ssh"
+        wrapper.write_text(f'#!/usr/bin/env bash\necho x >> {shlex.quote(str(log))}\nsleep 1\nexec {shlex.quote(str(self.ssh))} "$@"\n')
+        wrapper.chmod(0o755)
+        self.repo.env["AGENTIC_SSH"] = str(wrapper)
+        return log
+
+    def calls(self, log):
+        return len(log.read_text().splitlines()) if log.exists() else 0
+
+    def test_surveys_at_once_do_not_mark_a_peer_down_and_the_later_ones_use_the_first(self):
+        self.join()
+        self.init_on("box", "remote-one")
+        log = self.counting_ssh()
+        self.repo.command("overview", "--fleet", "--json")
+        one_survey = self.calls(log)
+        self.assertGreater(one_survey, 0)
+        log.unlink()
+        env = dict(self.repo.env, AGENTIC_FLEET_CACHE_SECONDS="30")
+        processes = [subprocess.Popen([str(self.repo.binary()), "overview", "--fleet", "--json"], cwd=self.repo.root, env=env,
+                                      text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(3)]
+        for process in processes:
+            out, err = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, err)
+            box = next(machine for machine in json.loads(out)["machines"] if machine["name"] == "box")
+            self.assertTrue(box["reachable"], box)
+            self.assertEqual([c["slug"] for c in box["campaigns"]], ["remote-one"])
+        # Only the first of the three asked the peer; the others waited for its lock and used what it learned.
+        self.assertEqual(self.calls(log), one_survey)
+        seen = json.loads((next(Path(self.repo.cache.name).glob("*/fleet-seen.json"))).read_text())
+        self.assertEqual([c["slug"] for c in seen["box"]["overview"]["campaigns"]], ["remote-one"])
+        # A change in the machines of the fleet is a survey of its own, whatever is cached.
+        self.repo.command("fleet", "leave", "box")
+        report = json.loads(self.repo.command("overview", "--fleet", "--json", env={"AGENTIC_FLEET_CACHE_SECONDS": "30"}).stdout)
+        self.assertEqual([machine["name"] for machine in report["machines"]], ["here"])
+
+    def test_the_cache_of_a_survey_is_off_at_zero_seconds(self):
+        self.join()
+        log = self.counting_ssh()
+        self.repo.command("fleet", "--json")
+        first = self.calls(log)
+        self.repo.command("fleet", "--json", env={"AGENTIC_FLEET_CACHE_SECONDS": "30"})
+        warm = self.calls(log)
+        self.repo.command("fleet", "--json", env={"AGENTIC_FLEET_CACHE_SECONDS": "30"})
+        self.assertEqual(self.calls(log), warm)
+        self.assertGreater(warm, first)
 
     def test_without_a_fleet(self):
         self.assertIn("No fleet holds proof", self.repo.command("fleet").stdout)

@@ -232,7 +232,7 @@ executor_sync_paths_back() {
 }
 
 # run_environment WORKTREE NAME...: sets environment to the NAME=VALUE words a run receives: every AGENTIC_* variable
-# but the transport ones, the variables NAME... that are set, the executor's env, then this side's git settings with
+# but the transport ones and the machine's own (AGENTIC_SLOT, AGENTIC_STATE), the variables NAME... that are set, the executor's env, then this side's git settings with
 # WORKTREE marked safe for git (the executor may see the files under another owner). A later word wins.
 run_environment() {
   local worktree=$1 variable count index key_name value_name
@@ -240,7 +240,8 @@ run_environment() {
   local -A forwarded=()
   environment=()
   while IFS= read -r variable; do
-    [[ $variable == AGENTIC_* && $variable != AGENTIC_SSH && $variable != AGENTIC_EXECUTORS ]] || continue
+    [[ $variable == AGENTIC_* && $variable != AGENTIC_SSH && $variable != AGENTIC_EXECUTORS \
+      && $variable != AGENTIC_SLOT && $variable != AGENTIC_STATE ]] || continue
     forwarded[$variable]=1; environment+=("$variable=${!variable}")
   done < <(compgen -e)
   for variable in "$@"; do

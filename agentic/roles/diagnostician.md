@@ -5,3 +5,6 @@ useful logs, the ticket, and relevant runtime state. Separate observed facts fro
 the root cause, supporting evidence, and a focused next action, using a smaller reproduction when
 available. Do not implement or repeat the expensive operation. Return the canonical RESULT with a
 recommended fix.
+
+Your Bash commands are read-only: the runner blocks `sed -i`, `perl -i`, redirections, heredocs and `tee` that write a file
+(`/tmp` and `/dev/null` are free) and every git command that writes.

@@ -4,7 +4,19 @@
   "instruction_files": ["AGENTS.md", "CLAUDE.md"],
   "env": {},
   "required_checks": [],
+  "capabilities": {
+    "dotnet": ["dotnet", "--version"],
+    "docker": ["docker", "info"]
+  },
+  "environment_failure_patterns": [],
   "timezone": "",
   "archive_dir": "",
-  "executors": []
+  "executors": [],
+  "task_preamble": "",
+  "task_links": {},
+  "task_cleanup": [],
+  "accept_regen": [],
+  "accept_checks": [],
+  "regen_paths": [],
+  "coordinator_paths": []
 }

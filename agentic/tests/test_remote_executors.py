@@ -191,6 +191,41 @@ class RemoteExecutorTests(unittest.TestCase):
         self.assertEqual(ticket_events.count('"role": "reviewer"'), 1)
         self.assertLess(ticket_events.index('"role": "worker"'), ticket_events.index('"role": "reviewer"'))
 
+    def test_a_tasks_plan_goes_to_the_remote_worker_as_its_spec_and_ticket(self):
+        # The plan of a task lives in the runtime, outside the worktree: remote_run_arguments gives the SPEC and the
+        # ticket as --file, and they are what reaches the executor.
+        repo = self.repo()
+        repo.mock_provider()
+        slug = "tsk-901"
+        text = "\n".join(["---", "id: TSK-901", "title: Write the product file", "after: []", "domains: [product]",
+                          "requires: []", "prefer: any", "review: false", "timeout_minutes: 30", "validate:",
+                          '  - "test -f product-T-001.txt"', "---", "", "# Objetivo", "", "Write the product file.", "",
+                          "# Aceite", "", "- the file exists.", ""])
+        brief = Path(repo.cache.name) / "brief.md"
+        brief.write_text(text)
+        script = 'source "$1/lib/common.sh" && runtime_dir "$2"'
+        runtime = Path(subprocess.run(["bash", "-c", script, "runtime", str(repo.root / ".agentic"), slug], cwd=repo.root,
+                                      env=repo.env, text=True, capture_output=True, check=True).stdout.strip())
+        repo.command("_task-plan", str(brief), str(runtime / "plan"))
+        worktree = runtime / "worktrees" / "campaign"
+        repo.git("worktree", "add", "-b", f"campaign/{slug}", str(worktree), "main")
+        (runtime / "campaign.json").write_text(json.dumps({
+            "slug": slug, "kind": "task", "branch": f"campaign/{slug}", "worktree": str(worktree),
+            "spec": str(runtime / "plan" / "SPEC.md")}))
+        arguments = subprocess.run(
+            ["bash", "-c", 'source "$1/lib/common.sh"; source "$1/lib/provider.sh"; remote_run_arguments box T-001',
+             "arguments", str(worktree / ".agentic")], cwd=worktree, env=repo.env, text=True, capture_output=True,
+            check=True).stdout.splitlines()
+        files = [arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--file"]
+        self.assertEqual(files, [str(runtime / "plan" / "SPEC.md"), str(runtime / "plan" / "tickets" / "T-001.md")])
+        result = repo.command("run", "--provider", "mock", "--workers", "1", cwd=worktree, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(repo.command("status", "--json", cwd=worktree).stdout)
+        self.assertEqual({item["id"]: item["status"] for item in status["tickets"]}, {"T-001": "done"})
+        self.assertIn(f" worker {self.remote(runtime / 'worktrees' / 'T-001')} ", self.run_log())
+        for name in files:
+            self.assertTrue(self.remote(name).is_file(), name)
+
     def test_the_uncommitted_delta_goes_to_the_remote_worker(self):
         repo = self.repo()
         repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
@@ -265,6 +300,16 @@ class RemoteExecutorTests(unittest.TestCase):
         self.assertIn("AGENTIC_TEST_PROJECT=yes", words)
         # The later word wins for env: the executor's value comes after the project's.
         self.assertLess(words.index("AGENTIC_TEST_SHARED=project"), words.index("AGENTIC_TEST_SHARED=executor"))
+
+    def test_what_belongs_to_the_machine_does_not_reach_the_executor(self):
+        repo = self.repo()
+        repo.init_campaign(); repo.configure([ticket()]); repo.mock_provider()
+        repo.env.update(AGENTIC_SLOT="2", AGENTIC_STATE="/machine/state", AGENTIC_TEST_SETTING="travels")
+        self.run_campaign(repo)
+        self.assertEqual(self.states(repo), {"TST-001": "done"})
+        words = self.run_log().splitlines()[0].split()
+        self.assertIn("AGENTIC_TEST_SETTING=travels", words)
+        self.assertEqual([word for word in words if word.startswith(("AGENTIC_SLOT=", "AGENTIC_STATE="))], [])
 
     def test_an_executor_without_a_required_command_sends_the_ticket_back_here(self):
         repo = self.repo(requires=["git", "agentic-missing-command"])
